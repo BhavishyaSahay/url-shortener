@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Test / coverage output
+coverage/
+tests/load/results/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
