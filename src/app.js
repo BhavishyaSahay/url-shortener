@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import cookieParser from 'cookie-parser';
 import express from 'express';
 import helmet from 'helmet';
 import { pinoHttp } from 'pino-http';
@@ -47,6 +48,8 @@ export function createApp() {
   // Parse JSON bodies. A small limit protects against huge payloads; a URL
   // shortener request is only a few hundred bytes.
   app.use(express.json({ limit: '10kb' }));
+  // Parse the Cookie header into req.cookies (the auth token lives in a cookie).
+  app.use(cookieParser());
 
   // Route order matters: fixed paths are registered first. In Phase 5 the
   // catch-all redirect route GET /:shortCode goes last, so it can't shadow them.

@@ -9,6 +9,9 @@ export default defineConfig({
       LOG_LEVEL: 'silent',
       // Unit tests never connect, but config validation requires a value.
       DATABASE_URL: TEST_DATABASE_URL,
+      // Fixed, test-only secret (never used outside tests).
+      JWT_SECRET: 'test-only-jwt-secret-at-least-32-characters-long',
+      JWT_EXPIRES_IN: '1d',
     },
     projects: [
       {

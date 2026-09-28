@@ -14,7 +14,7 @@ The project is built in phases, and each one is verified before the next starts.
 | ----- | ----- | ------ |
 | 1 | Express backend, config, `/health`, error handling, logging | ✅ Done |
 | 2 | PostgreSQL + Prisma schema, migrations, indexes, `/ready` | ✅ Done |
-| 3 | Authentication (JWT in HTTP-only cookies) | ⏳ |
+| 3 | Authentication: Argon2id, JWT in HTTP-only cookies | ✅ Done |
 | 4 | URL shortening (Base62, custom aliases, expiry) | ⏳ |
 | 5 | Redirects, Redis cache-aside, rate limiting | ⏳ |
 | 6 | Kafka click events + analytics worker | ⏳ |
@@ -30,6 +30,8 @@ Requirements: Node.js 20.12+ and Docker.
 
 ```bash
 cp .env.example .env
+# set JWT_SECRET in .env (required, 32+ chars):
+node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"
 npm install          # also generates the Prisma client (postinstall)
 npm run db:up        # start PostgreSQL in Docker and wait until it's healthy
 npm run db:migrate   # apply database migrations
@@ -77,4 +79,8 @@ tests/          unit/, integration/, load/ (k6)
 docs/           HLD, LLD, API, DATABASE, DEVOPS
 ```
 
-See [docs/DATABASE.md](docs/DATABASE.md) for the schema, index and pooling design.
+## Documentation
+
+- [docs/API.md](docs/API.md): endpoints with curl examples
+- [docs/LLD.md](docs/LLD.md): low-level design (authentication so far)
+- [docs/DATABASE.md](docs/DATABASE.md): schema, indexes, constraints, pooling

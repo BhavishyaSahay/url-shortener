@@ -54,6 +54,9 @@ export class GoneError extends AppError {
   }
 }
 
+// Prisma error code for a unique constraint violation (e.g. duplicate email or short code).
+export const isUniqueConstraintError = (err) => err?.code === 'P2002';
+
 export class TooManyRequestsError extends AppError {
   constructor(message = 'Too many requests, please try again later', retryAfterSeconds) {
     super(429, 'RATE_LIMITED', message);
