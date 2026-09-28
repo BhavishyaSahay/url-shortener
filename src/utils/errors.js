@@ -56,6 +56,8 @@ export class GoneError extends AppError {
 
 // Prisma error code for a unique constraint violation (e.g. duplicate email or short code).
 export const isUniqueConstraintError = (err) => err?.code === 'P2002';
+// Prisma error code when an update/delete matched no row.
+export const isRecordNotFoundError = (err) => err?.code === 'P2025';
 
 export class TooManyRequestsError extends AppError {
   constructor(message = 'Too many requests, please try again later', retryAfterSeconds) {

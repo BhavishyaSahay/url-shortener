@@ -15,7 +15,7 @@ The project is built in phases, and each one is verified before the next starts.
 | 1 | Express backend, config, `/health`, error handling, logging | ✅ Done |
 | 2 | PostgreSQL + Prisma schema, migrations, indexes, `/ready` | ✅ Done |
 | 3 | Authentication: Argon2id, JWT in HTTP-only cookies | ✅ Done |
-| 4 | URL shortening (Base62, custom aliases, expiry) | ⏳ |
+| 4 | URL shortening: Base62, custom aliases, expiry, CRUD with ownership checks | ✅ Done |
 | 5 | Redirects, Redis cache-aside, rate limiting | ⏳ |
 | 6 | Kafka click events + analytics worker | ⏳ |
 | 7 | Docker, Docker Compose, Nginx | ⏳ |
@@ -82,5 +82,5 @@ docs/           HLD, LLD, API, DATABASE, DEVOPS
 ## Documentation
 
 - [docs/API.md](docs/API.md): endpoints with curl examples
-- [docs/LLD.md](docs/LLD.md): low-level design (authentication so far)
+- [docs/LLD.md](docs/LLD.md): low-level design (Base62, collisions, concurrency, authorization, authentication)
 - [docs/DATABASE.md](docs/DATABASE.md): schema, indexes, constraints, pooling

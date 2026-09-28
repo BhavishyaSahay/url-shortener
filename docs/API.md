@@ -146,6 +146,114 @@ Errors: `401` no token, invalid or expired token, or the account no longer exist
 
 ---
 
-## URLs (Phase 4) · Redirects (Phase 5) · Analytics (Phase 6)
+## URLs 🔒
+
+All URL endpoints require authentication and only ever operate on the caller's own URLs.
+Another user's URL returns `404`, exactly like a nonexistent one.
+
+### The URL object
+
+```json
+{
+  "id": 1,
+  "shortCode": "1",
+  "shortUrl": "http://localhost:3000/1",
+  "originalUrl": "https://example.com/products/this-is-a-very-long-url",
+  "isCustomAlias": false,
+  "isActive": true,
+  "expiresAt": null,
+  "status": "active",
+  "createdAt": "2026-09-28T18:07:23.742Z",
+  "updatedAt": "2026-09-28T18:07:23.742Z"
+}
+```
+
+`status` is computed: `inactive` if `isActive` is false, else `expired` if `expiresAt` has
+passed, else `active`. Only `active` links redirect.
+
+### `POST /api/v1/urls`
+
+| Field | Required | Rules |
+| ----- | -------- | ----- |
+| `url` | yes | Absolute `http://` or `https://` URL, max 2048 chars, not a link to this shortener |
+| `customAlias` | no | 3–32 chars of `A-Z a-z 0-9 - _`, case-sensitive, not reserved (`api`, `health`, `ready`, `metrics`, …) |
+| `expiresAt` | no | ISO 8601 date-time **with timezone**, in the future, e.g. `2026-12-31T00:00:00Z` |
+
+Unknown fields are rejected (`400`), so a typo like `custom_alias` fails loudly.
+
+```bash
+curl -b cookies.txt -X POST http://localhost:3000/api/v1/urls \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com/some/long/url"}'
+
+curl -b cookies.txt -X POST http://localhost:3000/api/v1/urls \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","customAlias":"my-link","expiresAt":"2026-12-31T00:00:00Z"}'
+```
+
+**201 Created**, with a `Location: /api/v1/urls/{id}` header. Body: `{ "url": { ... } }`.
+
+Errors: `400` validation (see `details`) · `401` · `409` alias already taken (by anyone).
+
+### `GET /api/v1/urls`
+
+Your URLs, newest first.
+
+| Query | Default | Rules |
+| ----- | ------- | ----- |
+| `page` | 1 | ≥ 1 |
+| `limit` | 20 | 1–100 |
+
+```bash
+curl -b cookies.txt 'http://localhost:3000/api/v1/urls?page=1&limit=20'
+```
+
+```json
+{
+  "urls": [{ "id": 2, "shortCode": "my-link", "...": "..." }],
+  "pagination": { "page": 1, "limit": 20, "total": 2, "totalPages": 1 }
+}
+```
+
+### `GET /api/v1/urls/:id`
+
+```bash
+curl -b cookies.txt http://localhost:3000/api/v1/urls/1
+```
+
+**200** `{ "url": { ... } }` · `400` non-numeric ID · `404` not found or not yours.
+
+### `PATCH /api/v1/urls/:id`
+
+Send any subset of:
+
+| Field | Meaning |
+| ----- | ------- |
+| `url` | New destination (same rules as create) |
+| `isActive` | `false` deactivates (stops redirecting), `true` reactivates |
+| `expiresAt` | New future expiry, or `null` to remove it |
+
+The short code / alias can't be changed, because that would break links already shared.
+
+```bash
+curl -b cookies.txt -X PATCH http://localhost:3000/api/v1/urls/1 \
+  -H 'Content-Type: application/json' -d '{"isActive":false}'
+```
+
+**200** `{ "url": { ... } }` · `400` empty body / unknown field / invalid value · `404`.
+
+### `DELETE /api/v1/urls/:id`
+
+Permanently deletes the URL. A custom alias becomes available again.
+
+```bash
+curl -b cookies.txt -X DELETE http://localhost:3000/api/v1/urls/1
+```
+
+**204 No Content** · `404` not found or not yours.
+
+---
+
+## Redirects (Phase 5) · Analytics (Phase 6)
 
 Documented as each phase is built.

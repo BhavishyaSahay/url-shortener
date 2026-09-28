@@ -1,8 +1,153 @@
 # Low-Level Design
 
 Implementation details and the reasoning behind them. Sections are added as each phase is
-built: Base62 and collision handling (Phase 4), caching and rate limiting (Phase 5), and Kafka
-events (Phase 6).
+built. Still to come: caching and rate limiting (Phase 5), Kafka events (Phase 6).
+
+- [Base62 short codes](#base62-short-codes)
+- [Short-code generation and collision handling](#short-code-generation-and-collision-handling)
+- [Concurrency: why duplicates are impossible](#concurrency-why-duplicates-are-impossible)
+- [URL management and authorization](#url-management-and-authorization)
+- [Authentication](#authentication)
+
+## Base62 short codes
+
+`src/utils/base62.js` writes a number in base 62 using the alphabet:
+
+```text
+0123456789 abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ
+ values 0-9        values 10-35               values 36-61
+```
+
+**Encoding** is repeated division by 62, the same way you'd convert decimal to binary by hand.
+Each remainder is a digit, least significant first:
+
+```text
+123456 ÷ 62 = 1991  remainder 14  → 'e'
+  1991 ÷ 62 =   32  remainder  7  → '7'
+    32 ÷ 62 =    0  remainder 32  → 'w'
+                                     read upwards: "w7e"
+check: 32·62² + 7·62 + 14 = 123008 + 434 + 14 = 123456 ✓
+```
+
+(The project brief's example, `123456 → w7E2`, was illustrative. With this alphabet the real
+encoding is `w7e`, and a unit test pins it.)
+
+**Decoding** reverses it: `num = num * 62 + value(char)` for each character.
+
+**Why Base62?**
+
+- Every character is URL-safe (no `+`, `/`, `=` like Base64), so codes go straight into the path.
+- Codes are short, because *k* characters give 62^k codes:
+
+| Length | Codes | Reached at ID |
+| ------ | ----- | ------------- |
+| 1 | 62 | 0 – 61 |
+| 3 | 238,328 | ≤ 238,327 |
+| 4 | 14.8 million | ≤ 14,776,335 |
+| 6 | 56.8 billion | covers the whole PostgreSQL `INTEGER` range (max `2147483647` → `2lkCB1`) |
+| 7 | 3.5 trillion | the Bitly-scale range |
+
+- **Case-sensitive:** `a` (10) and `A` (36) are different digits, so `aB9` ≠ `ab9`. PostgreSQL
+  `VARCHAR` comparison is case-sensitive, so the unique index agrees.
+- **Bijective:** each number has exactly one code and each code exactly one number. So unique
+  IDs mean unique codes.
+
+## Short-code generation and collision handling
+
+`createUrl` in `src/services/url.service.js`:
+
+```text
+customAlias given?
+ ├─ yes: INSERT (short_code = alias, is_custom_alias = true)
+ │         └─ unique violation (P2002) ──────────────────────────────► 409 "alias already taken"
+ │
+ └─ no:  repeat up to 5 times:
+           id   = SELECT nextval('urls_id_seq')      -- atomic, never repeats
+           code = base62(id)
+           INSERT (id, short_code = code, …)          -- one statement
+             ├─ ok ──────────────────────────────────────────────────► 201
+             └─ unique violation: code equals an existing custom alias
+                  → log a warning, loop (next id), leaving a harmless gap in the IDs
+```
+
+**Why reserve the ID first with `nextval()`?** The code depends on the ID, but a normal
+`INSERT` only gives you the ID *after* the row exists. The alternatives are worse:
+
+| Approach | Problem |
+| -------- | ------- |
+| INSERT with a placeholder code, then UPDATE with base62(id) | Two writes, and a window where the row has a fake code (needs a transaction) |
+| Random code, then "SELECT to check it's free", then INSERT | Check-then-act race, plus collisions grow as the table fills (birthday paradox) |
+| Hash the long URL (MD5, …) and take 7 characters | Collisions possible and must be handled. Same URL from two users gives the same code |
+| **`nextval()` → base62 → one INSERT** | **Chosen:** one write, no race, no collisions between generated codes |
+
+**Where collisions can still happen.** Generated codes never collide with *each other*, because
+IDs are unique. They can collide with a **custom alias**: if someone claimed alias `w7e`, then ID
+123456 would also want `w7e`. Both kinds of code live in one `short_code` column with one unique
+index (see [DATABASE.md](DATABASE.md)), so the database rejects the second insert and we retry
+with the next ID. The integration test forces this: it sets the sequence, pre-claims the next
+code as an alias, and checks the generator skips to the following ID.
+
+**Reserved aliases.** Aliases share the root path with real routes (`/health`, `/ready`,
+`/metrics`, `/api/…`), so they're blocked case-insensitively. Aliases can't contain `.` or `/`,
+so `favicon.ico` and `robots.txt` are impossible anyway.
+
+### Known trade-off: sequential codes are predictable
+
+Because codes come from a counter, they are guessable: anyone can walk `/1`, `/2`, `/3` … and
+discover every link, and early links are only one or two characters long. Links here aren't
+secret (like Bitly links, they're meant to be shared), but it's a real consideration:
+
+| Option | Effect | Cost |
+| ------ | ------ | ---- |
+| Keep as is | Simple and easy to reason about | Enumerable. The first 61 codes are 1 character |
+| Start the sequence at 62³ (`ALTER SEQUENCE … RESTART 238328`) | Every code is ≥ 4 characters | Still sequential |
+| Scramble the ID before encoding (a reversible permutation, e.g. multiply by a large prime mod 62⁶) | Codes look random, stay unique, same length | Slightly more code to explain |
+| Random codes + unique index + retry on conflict | Not enumerable | Retries grow as the space fills. Loses the "no collisions" property |
+
+## Concurrency: why duplicates are impossible
+
+The rule is: **never "check, then write"; let one atomic database operation decide.**
+
+| Scenario | What prevents the bug | Test |
+| -------- | --------------------- | ---- |
+| 25 simultaneous creates on 1–N API instances | `nextval()` hands each one a distinct ID (the sequence is shared state inside Postgres, not in Node memory) | 25 parallel requests → 25 distinct codes |
+| 5 users claim alias `race` at the same moment | Unique index: exactly one INSERT wins, the rest get P2002 → 409 | `[201, 409, 409, 409, 409]` |
+| Generated code equals an existing alias | Unique index + retry with the next ID | Forced collision test |
+| Same email registered twice at once | Unique index on `users.email` | `[201, 409, 409, 409, 409]` |
+
+Why a counter in Node (`let next = 1`) would be wrong: each API instance has its own memory, so
+two instances would both hand out ID 7. And a restart would reset it. The database sequence is
+the single source of truth that all instances share. Sequences are also **not transactional**:
+a rolled-back or failed insert doesn't give its number back. That's why gaps appear, and why
+the same number can never be handed out twice.
+
+## URL management and authorization
+
+Every single-URL query filters by **both** `id` and the caller's `userId`, in the same SQL
+statement:
+
+```js
+prisma.url.update({ where: { id, userId }, data });   // UPDATE … WHERE id = $1 AND user_id = $2
+prisma.url.delete({ where: { id, userId } });         // DELETE … WHERE id = $1 AND user_id = $2
+prisma.url.findFirst({ where: { id, userId } });
+```
+
+- **Atomic:** no "load the row, compare `row.userId`, then save" sequence that another request
+  could slip between. If the row doesn't exist *or* belongs to someone else, zero rows match,
+  Prisma throws P2025, and we return **404**.
+- **404, not 403, for someone else's URL.** A 403 would confirm that ID 57 exists. With 404, an
+  attacker learns nothing by probing IDs.
+- The **short code can't be edited** (`PATCH` is a `strictObject` without `shortCode`).
+  Changing it would break every place the link was shared, and complicate cache invalidation.
+- **`status`** (`active` / `inactive` / `expired`) is computed on read from `isActive` and
+  `expiresAt` (`src/utils/expiration.js`). No background job has to flip a flag at the exact
+  moment a link expires. Deactivation wins over expiry.
+- **URL validation:** only `http`/`https`, because redirecting to `javascript:` would let our
+  trusted domain run scripts in a victim's browser. No links to the shortener itself (loops).
+  Max 2048 characters. `expiresAt` must be ISO 8601 **with a timezone** and in the future.
+- **Pagination:** offset-based (`page`, `limit ≤ 100`), ordered by `created_at DESC, id DESC`.
+  `id` breaks ties so pages are stable. Offset pagination gets slower on very deep pages; at
+  scale, cursor pagination (`WHERE (created_at, id) < ($1, $2)`) fixes that.
 
 ## Authentication
 
