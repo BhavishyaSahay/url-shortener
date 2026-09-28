@@ -18,6 +18,10 @@ const envSchema = z.object({
   APP_BASE_URL: z.url().default('http://localhost:3000'),
   // How long to wait for in-flight requests to finish on SIGTERM before forcing exit.
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().positive().default(10_000),
+
+  // PostgreSQL
+  DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/, error: 'must be a postgresql:// URL' }),
+  DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(10),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -43,4 +47,8 @@ export const config = Object.freeze({
   logLevel: env.LOG_LEVEL,
   baseUrl: env.APP_BASE_URL.replace(/\/+$/, ''),
   shutdownTimeoutMs: env.SHUTDOWN_TIMEOUT_MS,
+  database: {
+    url: env.DATABASE_URL,
+    poolMax: env.DB_POOL_MAX,
+  },
 });

@@ -1,21 +1,30 @@
 import { config } from './config/env.js';
+import { connectDatabase, disconnectDatabase } from './config/database.js';
 import { logger } from './utils/logger.js';
 import { createApp } from './app.js';
 
 const app = createApp();
+let server;
 
-const server = app.listen(config.port, () => {
-  logger.info({ port: config.port, env: config.env }, 'API server listening');
-});
+// Startup order matters: connect to dependencies FIRST, then accept traffic.
+// If PostgreSQL is still starting (common with Docker Compose), connectDatabase
+// retries. The API never listens while pretending the database is available.
+async function start() {
+  await connectDatabase();
+
+  server = app.listen(config.port, () => {
+    logger.info({ port: config.port, env: config.env }, 'API server listening');
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
 // Docker sends SIGTERM when stopping a container (Ctrl+C sends SIGINT). Instead
 // of dying immediately and cutting off in-flight requests, we:
-//   1. stop accepting new connections
-//   2. let in-flight requests finish
-//   3. close connections to external services (PostgreSQL, Redis, Kafka; added in later phases)
+//   1. mark the instance not-ready (GET /ready returns 503)
+//   2. stop accepting new connections and let in-flight requests finish
+//   3. close connections to external services
 //   4. exit
 // If this takes longer than SHUTDOWN_TIMEOUT_MS we force-exit, because Docker
 // will SIGKILL us anyway after its own grace period (10s by default).
@@ -24,6 +33,7 @@ let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
+  app.locals.isShuttingDown = true;
   logger.info({ signal }, 'Shutdown started');
 
   const forceExitTimer = setTimeout(() => {
@@ -35,14 +45,19 @@ async function shutdown(signal) {
   try {
     // server.close() stops new connections and resolves once active requests
     // finish. Node closes idle keep-alive connections automatically.
-    await new Promise((resolve, reject) => {
-      server.close((err) => (err ? reject(err) : resolve()));
-    });
-    logger.info('HTTP server closed');
+    // `server` is undefined if the signal arrived while still connecting on startup.
+    if (server) {
+      await new Promise((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+      logger.info('HTTP server closed');
+    }
 
-    // Later phases disconnect external clients here, e.g.:
-    //   await prisma.$disconnect();   (Phase 2)
-    //   await redis.quit();           (Phase 5)
+    // Close external clients only after in-flight requests have finished,
+    // because those requests may still need the database.
+    await disconnectDatabase();
+    // Later phases:
+    //   await redis.quit();               (Phase 5)
     //   await kafkaProducer.disconnect(); (Phase 6)
 
     logger.info('Shutdown complete');
@@ -64,5 +79,10 @@ process.on('unhandledRejection', (reason) => {
 });
 process.on('uncaughtException', (err) => {
   logger.fatal({ err }, 'Uncaught exception');
+  process.exit(1);
+});
+
+start().catch((err) => {
+  logger.fatal({ err }, 'Failed to start API server');
   process.exit(1);
 });

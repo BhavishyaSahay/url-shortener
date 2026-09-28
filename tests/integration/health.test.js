@@ -28,6 +28,22 @@ describe('GET /health', () => {
   });
 });
 
+describe('GET /ready', () => {
+  it('returns 200 when PostgreSQL is reachable', async () => {
+    const res = await request(createApp()).get('/ready');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ status: 'ready', checks: { database: 'up' } });
+  });
+
+  it('returns 503 during graceful shutdown so load balancers stop sending traffic', async () => {
+    const app = createApp();
+    app.locals.isShuttingDown = true;
+    const res = await request(app).get('/ready');
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('shutting_down');
+  });
+});
+
 describe('error handling on the real app', () => {
   const app = createApp();
 

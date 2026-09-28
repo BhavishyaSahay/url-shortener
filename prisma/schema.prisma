@@ -1,0 +1,65 @@
+// Database schema. Source of truth for tables, constraints and indexes.
+// After editing: `npm run db:migrate -- --name <what_changed>` creates a SQL migration.
+//
+// Naming: models/fields are camelCase in JavaScript, but @map/@@map store them
+// as snake_case in PostgreSQL (the SQL convention), e.g. User.passwordHash ->
+// users.password_hash.
+
+generator client {
+  // "prisma-client-js" generates plain JavaScript into node_modules/@prisma/client.
+  // (Prisma 7's newer "prisma-client" generator emits TypeScript, which this
+  // JavaScript-only project can't run without a build step.)
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // The connection URL is read from DATABASE_URL in prisma.config.js.
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  // @unique creates a unique index: prevents duplicate accounts AND makes
+  // the login lookup (WHERE email = ?) an index lookup instead of a table scan.
+  // Emails are lower-cased by the app before saving, so uniqueness is case-insensitive.
+  email        String   @unique @db.VarChar(255)
+  passwordHash String   @map("password_hash") @db.VarChar(255)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  urls Url[]
+
+  @@map("users")
+}
+
+model Url {
+  // Auto-increment ID backed by the PostgreSQL sequence "urls_id_seq".
+  // In Phase 4 the Base62 short code is derived from this number.
+  id            Int       @id @default(autoincrement())
+  userId        Int       @map("user_id")
+  // The code in the short link (/aB92x). Generated codes and custom aliases
+  // share this ONE column, so a single unique constraint guarantees that no
+  // alias can ever collide with a generated code. Also the index behind the
+  // hottest query in the system: the redirect lookup (WHERE short_code = ?).
+  shortCode     String    @unique @map("short_code") @db.VarChar(32)
+  originalUrl   String    @map("original_url") @db.VarChar(2048)
+  // true if the user chose the code (custom alias), false if it was generated.
+  isCustomAlias Boolean   @default(false) @map("is_custom_alias")
+  isActive      Boolean   @default(true) @map("is_active")
+  // NULL = never expires. timestamptz stores an absolute instant (UTC), so
+  // expiry checks are correct no matter which timezone the server runs in.
+  expiresAt     DateTime? @map("expires_at") @db.Timestamptz(6)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  // Foreign key: every URL belongs to an existing user. Deleting a user
+  // deletes their URLs (ON DELETE CASCADE) instead of leaving orphans.
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // "My URLs" dashboard: WHERE user_id = ? ORDER BY created_at DESC.
+  // A composite index serves both the filter and the sort. PostgreSQL does NOT
+  // index foreign keys automatically, and this index also covers the FK
+  // (leftmost column), which keeps ON DELETE CASCADE fast.
+  @@index([userId, createdAt(sort: Desc)])
+  @@map("urls")
+}

@@ -1,0 +1,39 @@
+# Local development infrastructure.
+# Phase 2: PostgreSQL only. Redis, Kafka, the API, the worker and Nginx are
+# added in later phases.
+#
+#   docker compose up -d postgres     start the database
+#   docker compose ps                 check it is "healthy"
+#   docker compose down               stop (data is kept in the named volume)
+#   docker compose down -v            stop AND delete all data
+
+name: url-shortener
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      # Local-dev defaults only. Production credentials come from the
+      # environment and are never written in compose files.
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-url_shortener}
+    ports:
+      # host:container. Bound to 127.0.0.1 so the database isn't reachable from
+      # your LAN. Host port defaults to 5433 to avoid clashing with a locally
+      # installed PostgreSQL on 5432. Containers still talk to it on 5432.
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      # Named volume: data survives container restarts and `docker compose down`.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready reports healthy only once Postgres accepts connections,
+      # not merely when the container process has started.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
