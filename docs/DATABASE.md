@@ -24,7 +24,34 @@ Schema: [`prisma/schema.prisma`](../prisma/schema.prisma) · Migrations: [`prism
 PK = primary key   U = unique   FK = foreign key (ON DELETE CASCADE)
 ```
 
-The analytics tables for click events are added in Phase 6 with their own migration.
+Analytics tables (Phase 6, migration `add_click_analytics`), written only by the worker:
+
+```text
+┌──────────────────────────────────┐        ┌─────────────────────────────────┐
+│ click_events                     │        │ url_daily_stats                 │
+├──────────────────────────────────┤        ├─────────────────────────────────┤
+│ id            BIGSERIAL       PK │        │ url_id  INTEGER  PK, FK → urls  │
+│ event_id      UUID             U │        │ day     DATE     PK             │
+│ url_id        INTEGER  FK → urls │        │ clicks  INTEGER                 │
+│ clicked_at    TIMESTAMPTZ        │        └─────────────────────────────────┘
+│ ip_hash       VARCHAR(64)        │   both: ON DELETE CASCADE from urls
+│ user_agent    VARCHAR(512)       │
+│ browser       VARCHAR(32)        │   index: click_events (url_id, clicked_at)
+│ referrer_host VARCHAR(255)       │
+└──────────────────────────────────┘
+```
+
+- **`click_events`**: one row per click, the detailed record behind referrers, browsers and
+  unique visitors.
+  - `BIGSERIAL`, because clicks outnumber URLs by orders of magnitude.
+  - `event_id UNIQUE` makes the worker idempotent under Kafka's at-least-once delivery.
+  - Only an HMAC of the IP and the referrer *host* are stored (data minimization).
+- **`url_daily_stats`**: a pre-aggregated rollup with a composite PK `(url_id, day)`. The
+  "clicks per day" chart reads about 30 tiny rows instead of counting millions of events. The
+  worker upserts it with `INSERT … ON CONFLICT (url_id, day) DO UPDATE SET clicks = clicks + n`
+  in the same transaction as the raw insert.
+- **Raw plus rollup, not just one:** raw rows keep flexibility for new breakdowns, and rollups
+  keep the most common query cheap. Days are UTC.
 
 ## Constraints
 
@@ -96,6 +123,9 @@ too) and uses disk. So I only created indexes for queries the app will actually 
 | Redirect: `SELECT … FROM urls WHERE short_code = $1` | **Very high**: every click (on a Redis miss) | `urls_short_code_key` (unique B-tree) |
 | Dashboard: `… WHERE user_id = $1 ORDER BY created_at DESC LIMIT 20` | Medium: every dashboard load | `urls_user_id_created_at_idx` on `(user_id, created_at DESC)` |
 | Login: `SELECT … FROM users WHERE email = $1` | Medium | `users_email_key` (unique B-tree) |
+| Analytics breakdowns: `… FROM click_events WHERE url_id = $1 AND clicked_at >= $2 GROUP BY …` | Low (owner dashboard) | `click_events_url_id_clicked_at_idx` |
+| Clicks per day: `… FROM url_daily_stats WHERE url_id = $1 AND day >= $2` | Low | Primary key `(url_id, day)` |
+| Worker dedupe: `INSERT … ON CONFLICT (event_id)` | Every click (batched) | `click_events_event_id_key` |
 | By ID: `WHERE id = $1` (get/update/delete a URL) | Medium | Primary key |
 
 Notes:

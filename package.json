@@ -17,7 +17,9 @@
     "db:generate": "prisma generate",
     "db:studio": "prisma studio",
     "db:reset": "prisma migrate reset",
-    "postinstall": "prisma generate"
+    "postinstall": "prisma generate",
+    "worker": "SERVICE_NAME=analytics-worker node worker/analytics.worker.js",
+    "worker:dev": "SERVICE_NAME=analytics-worker node --watch worker/analytics.worker.js"
   },
   "license": "MIT",
   "type": "module",
@@ -34,6 +36,7 @@
     "helmet": "^8.3.0",
     "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.3",
+    "kafkajs": "^2.2.4",
     "pg": "^8.23.0",
     "pino": "^10.3.1",
     "pino-http": "^11.0.0",

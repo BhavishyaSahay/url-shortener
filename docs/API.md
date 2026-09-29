@@ -64,14 +64,15 @@ curl http://localhost:3000/health
 
 ### `GET /ready`: readiness
 
-Can this instance serve traffic? PostgreSQL is **critical**. Redis is **non-critical**: the API
-works without it, just slower and without rate limiting.
+Can this instance serve traffic? PostgreSQL is **critical**. Redis and Kafka are
+**non-critical**: without Redis the API is slower and unrate-limited, and without Kafka clicks
+aren't recorded, but everything else works.
 
 | Status | Body |
 | ------ | ---- |
-| 200 | `{ "status": "ready", "checks": { "database": "up", "redis": "up" } }` |
-| 200 | `{ "status": "degraded", "checks": { "database": "up", "redis": "down" } }` |
-| 503 | `{ "status": "not_ready", "checks": { "database": "down", "redis": "…" } }` |
+| 200 | `{ "status": "ready", "checks": { "database": "up", "redis": "up", "kafka": "up" } }` |
+| 200 | `{ "status": "degraded", "checks": { "database": "up", "redis": "down", "kafka": "up" } }` |
+| 503 | `{ "status": "not_ready", "checks": { "database": "down", … } }` |
 | 503 | `{ "status": "shutting_down" }` during graceful shutdown |
 
 ---
@@ -320,6 +321,60 @@ Retry-After: 222
 
 ---
 
-## Analytics (Phase 6)
+## Analytics 🔒
 
-Documented when built.
+### `GET /api/v1/urls/:id/analytics`
+
+Click analytics for one of **your** URLs (someone else's returns `404`).
+
+| Query | Default | Rules |
+| ----- | ------- | ----- |
+| `days` | 30 | 1–365. The window for `clicksByDay`, `topReferrers` and `userAgents` |
+
+```bash
+curl -b cookies.txt 'http://localhost:3000/api/v1/urls/6/analytics?days=3'
+```
+
+**200 OK** (real output from a manual test):
+
+```json
+{
+  "urlId": 6,
+  "shortCode": "6",
+  "totalClicks": 5,
+  "uniqueVisitors": 1,
+  "lastClickedAt": "2026-09-29T17:38:44.207Z",
+  "period": { "days": 3, "from": "2026-09-27T00:00:00.000Z", "to": "2026-09-29T17:38:47.250Z" },
+  "clicksByDay": [
+    { "date": "2026-09-27", "clicks": 0 },
+    { "date": "2026-09-28", "clicks": 0 },
+    { "date": "2026-09-29", "clicks": 5 }
+  ],
+  "topReferrers": [
+    { "referrer": "twitter.com", "clicks": 3 },
+    { "referrer": "direct", "clicks": 1 },
+    { "referrer": "news.ycombinator.com", "clicks": 1 }
+  ],
+  "userAgents": [
+    { "browser": "Chrome", "clicks": 3 },
+    { "browser": "Bot", "clicks": 1 },
+    { "browser": "Firefox", "clicks": 1 }
+  ]
+}
+```
+
+| Field | Meaning |
+| ----- | ------- |
+| `totalClicks`, `uniqueVisitors`, `lastClickedAt` | **All time**. Unique visitors are distinct hashed IPs (approximate: shared IPs merge, changing IPs split) |
+| `clicksByDay` | One entry per day in the window (UTC), zero-filled |
+| `topReferrers` | Top 10 referring **hosts** in the window. `direct` means no `Referer` header |
+| `userAgents` | Top 10 browser families in the window: Chrome, Safari, Firefox, Edge, Opera, Bot (crawlers, curl, scripts), Other, Unknown |
+
+Notes:
+
+- **Eventually consistent:** clicks are processed asynchronously (API → Kafka → worker), so a
+  click appears here shortly after the redirect, not instantly.
+- `HEAD` requests aren't counted. Clicks while Kafka is unavailable aren't recorded (redirects
+  still work).
+
+Errors: `400` invalid `days` or ID · `401` · `404` not found or not yours.

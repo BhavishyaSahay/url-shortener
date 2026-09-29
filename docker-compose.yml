@@ -1,6 +1,6 @@
 # Local development infrastructure.
-# So far: PostgreSQL + Redis. Kafka, the API, the worker and Nginx are added
-# in later phases.
+# So far: PostgreSQL, Redis and Kafka. The API, the worker and Nginx are
+# containerized in Phase 7.
 #
 #   docker compose up -d --wait       start everything, wait until healthy
 #   docker compose ps                 check it is "healthy"
@@ -62,5 +62,49 @@ services:
       retries: 10
     restart: unless-stopped
 
+  kafka:
+    image: apache/kafka:4.1.0
+    # Single-node Kafka in KRaft mode: this one process is both the broker
+    # (stores messages) and the controller (cluster metadata). KRaft replaced
+    # ZooKeeper, so there's no separate ZooKeeper container.
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Two client listeners, because "where is Kafka?" depends on who's asking:
+      #   INTERNAL kafka:19092     containers on the Docker network (API/worker in Phase 7)
+      #   EXTERNAL localhost:9092  processes on your Mac (npm run dev, tests)
+      # Clients first connect to any address, then Kafka tells them the
+      # "advertised" address to use, so it must be reachable from the client's side.
+      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://localhost:${KAFKA_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # One broker, so internal topics can only have one copy.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Topics are created deliberately (by the worker), not by typos.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Consumers join their group immediately instead of waiting 3 s (nicer in dev/tests).
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Kafka's JVM defaults to 1 GB of heap; 512 MB is plenty for local development.
+      KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - "127.0.0.1:${KAFKA_PORT:-9092}:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # Healthy once the broker answers API requests.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
 volumes:
   postgres-data:
+  kafka-data:

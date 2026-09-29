@@ -104,6 +104,10 @@ export const urlIdParamsSchema = z.object({
   id: z.coerce.number().int().positive().max(2_147_483_647),
 });
 
+export const analyticsQuerySchema = z.object({
+  days: z.coerce.number().int().min(1).max(365).default(30),
+});
+
 export const listUrlsQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   limit: z.coerce.number().int().min(1).max(100).default(20),

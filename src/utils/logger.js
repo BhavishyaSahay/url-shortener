@@ -6,7 +6,7 @@ import { config } from '../config/env.js';
 // In development we pretty-print for readability instead.
 export const logger = pino({
   level: config.logLevel,
-  base: { service: 'url-shortener-api' },
+  base: { service: config.serviceName },
   timestamp: pino.stdTimeFunctions.isoTime,
   // Write "level":"info" instead of pino's default numeric "level":30.
   formatters: { level: (label) => ({ level: label }) },

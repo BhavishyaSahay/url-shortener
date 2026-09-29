@@ -75,7 +75,7 @@ describe('GET /:shortCode: redirect', () => {
 
   it('does not shadow the fixed routes', async () => {
     expect((await request(app).get('/health')).body.status).toBe('ok');
-    expect((await request(app).get('/ready')).body.status).toBe('ready');
+    expect((await request(app).get('/ready')).status).toBe(200);
   });
 });
 
@@ -202,6 +202,7 @@ describe('when Redis is down', () => {
     redis.disconnect();
     const res = await request(app).get('/ready');
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ status: 'degraded', checks: { database: 'up', redis: 'down' } });
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.checks).toMatchObject({ database: 'up', redis: 'down' });
   });
 });

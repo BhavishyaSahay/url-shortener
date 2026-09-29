@@ -1,5 +1,6 @@
 import { config } from './config/env.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
+import { connectProducer, disconnectProducer } from './config/kafka.js';
 import { connectRedis, disconnectRedis } from './config/redis.js';
 import { logger } from './utils/logger.js';
 import { createApp } from './app.js';
@@ -11,8 +12,14 @@ let server;
 // If PostgreSQL is still starting (common with Docker Compose), connectDatabase
 // retries. The API never listens while pretending the database is available.
 async function start() {
+  // The API signs login tokens, so it can't run without the secret.
+  if (!config.auth.jwtSecret) {
+    throw new Error('JWT_SECRET is required to run the API (at least 32 characters, see .env.example)');
+  }
+
   await connectDatabase(); // required: waits/retries, exits if it never comes up
   await connectRedis(); // optional: never blocks startup, reconnects in the background
+  await connectProducer(); // optional: same, redirects work without Kafka
 
   server = app.listen(config.port, () => {
     logger.info({ port: config.port, env: config.env }, 'API server listening');
@@ -57,8 +64,8 @@ async function shutdown(signal) {
 
     // Close external clients only after in-flight requests have finished,
     // because those requests may still need the database.
-    await Promise.all([disconnectDatabase(), disconnectRedis()]);
-    // Phase 6: await kafkaProducer.disconnect();
+    // The producer flushes any click events still in flight before closing.
+    await Promise.all([disconnectDatabase(), disconnectRedis(), disconnectProducer()]);
 
     logger.info('Shutdown complete');
     process.exit(0);

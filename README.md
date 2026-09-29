@@ -17,7 +17,7 @@ The project is built in phases, and each one is verified before the next starts.
 | 3 | Authentication: Argon2id, JWT in HTTP-only cookies | ✅ Done |
 | 4 | URL shortening: Base62, custom aliases, expiry, CRUD with ownership checks | ✅ Done |
 | 5 | Redirects, Redis cache-aside, negative caching, fixed-window rate limiting | ✅ Done |
-| 6 | Kafka click events + analytics worker | ⏳ |
+| 6 | Kafka click events, analytics worker (idempotent, batched), analytics API | ✅ Done |
 | 7 | Docker, Docker Compose, Nginx | ⏳ |
 | 8 | CI/CD with GitHub Actions | ⏳ |
 | 9 | AWS EC2 deployment | ⏳ |
@@ -33,18 +33,19 @@ cp .env.example .env
 # set JWT_SECRET in .env (required, 32+ chars):
 node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"
 npm install          # also generates the Prisma client (postinstall)
-npm run db:up        # start PostgreSQL + Redis in Docker, wait until healthy
+npm run db:up        # start PostgreSQL, Redis and Kafka in Docker, wait until healthy
 npm run db:migrate   # apply database migrations
-npm run dev          # start the API with auto-reload
+npm run dev          # terminal 1: the API, with auto-reload
+npm run worker:dev   # terminal 2: the analytics worker (Kafka → PostgreSQL)
 ```
 
 ```bash
 curl http://localhost:3000/health   # liveness: is the process up?
-curl http://localhost:3000/ready    # readiness: PostgreSQL (critical) + Redis (optional)
+curl http://localhost:3000/ready    # readiness: PostgreSQL (critical), Redis and Kafka (optional)
 ```
 
 Containers are published on non-default host ports to avoid clashing with locally installed
-services: **PostgreSQL on 5433** and **Redis on 6380**. Change `POSTGRES_PORT`/`DATABASE_URL`
+services: **PostgreSQL on 5433**, **Redis on 6380**, and Kafka on its usual **9092**. Change `POSTGRES_PORT`/`DATABASE_URL`
 and `REDIS_PORT`/`REDIS_URL` in `.env` if needed.
 
 ## Scripts
@@ -56,8 +57,9 @@ and `REDIS_PORT`/`REDIS_URL` in `.env` if needed.
 | `npm run lint` | Run ESLint |
 | `npm test` | Run all tests |
 | `npm run test:unit` | Unit tests only |
-| `npm run test:integration` | Integration tests (need PostgreSQL + Redis running; use a separate `_test` DB and Redis DB 1) |
-| `npm run db:up` | Start PostgreSQL + Redis (Docker) and wait for their health checks |
+| `npm run test:integration` | Integration tests (need the Docker services running; use a `_test` DB, Redis DB 1 and a per-run Kafka topic) |
+| `npm run worker` | Start the analytics worker (`worker:dev` for auto-reload) |
+| `npm run db:up` | Start PostgreSQL, Redis and Kafka (Docker) and wait for their health checks |
 | `npm run db:migrate` | Create/apply migrations in development |
 | `npm run db:deploy` | Apply pending migrations (CI/production) |
 | `npm run db:studio` | Browse the database in Prisma Studio |
@@ -75,13 +77,14 @@ src/
   app.js        builds the Express app (used by server and tests)
   server.js     starts the HTTP server and handles graceful shutdown
 prisma/         schema.prisma + SQL migrations
-worker/         Kafka analytics consumer (Phase 6)
+worker/         analytics worker: Kafka consumer → PostgreSQL (separate process)
 tests/          unit/, integration/, load/ (k6)
 docs/           HLD, LLD, API, DATABASE, DEVOPS
 ```
 
 ## Documentation
 
+- [docs/HLD.md](docs/HLD.md): high-level design (architecture, flows, scaling, failure handling)
 - [docs/API.md](docs/API.md): endpoints with curl examples
-- [docs/LLD.md](docs/LLD.md): low-level design (caching, rate limiting, Base62, collisions, concurrency, auth)
+- [docs/LLD.md](docs/LLD.md): low-level design (Kafka, caching, rate limiting, Base62, concurrency, auth)
 - [docs/DATABASE.md](docs/DATABASE.md): schema, indexes, constraints, pooling

@@ -1,3 +1,4 @@
+import { buildClickEvent, publishClickEvent } from '../services/clickEvent.service.js';
 import * as redirectService from '../services/redirect.service.js';
 import { NotFoundError } from '../utils/errors.js';
 
@@ -24,5 +25,18 @@ export async function redirect(req, res) {
   res.set('Cache-Control', 'private, no-store');
   res.redirect(302, url.originalUrl);
 
-  // Phase 6: publish a click event to Kafka here (after responding, without awaiting).
+  // Analytics happen AFTER the response is sent, and are not awaited: the
+  // user never waits for Kafka, and a Kafka failure can't break the redirect.
+  // HEAD requests (link checkers, some previewers) aren't counted as clicks.
+  if (req.method === 'GET') {
+    void publishClickEvent(
+      buildClickEvent({
+        url,
+        shortCode,
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        referrer: req.get('referer'),
+      }),
+    );
+  }
 }

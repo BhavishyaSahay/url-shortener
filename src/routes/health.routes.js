@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { isDatabaseHealthy } from '../config/database.js';
+import { isProducerHealthy } from '../config/kafka.js';
 import { isRedisHealthy } from '../config/redis.js';
 
 const router = Router();
@@ -23,10 +24,10 @@ router.get('/health', (req, res) => {
 // Dependencies are split into two kinds:
 //   critical      PostgreSQL: without it we can't serve anything → 503
 //   non-critical  Redis: we still work without it (slower, no rate limiting)
+//                 Kafka: redirects still work, click events are dropped
 //                 → 200 "degraded". Failing readiness here would pull EVERY
-//                 instance out of rotation during a cache outage, turning
-//                 "slower" into "completely down".
-// Kafka (Phase 6) will be non-critical too: redirects must not depend on analytics.
+//                 instance out of rotation during a cache or analytics outage,
+//                 turning "degraded" into "completely down".
 router.get('/ready', async (req, res) => {
   // During graceful shutdown, report not-ready so traffic drains away
   // before the process exits.
@@ -35,13 +36,15 @@ router.get('/ready', async (req, res) => {
   }
 
   const [databaseUp, redisUp] = await Promise.all([isDatabaseHealthy(), isRedisHealthy()]);
+  const kafkaUp = isProducerHealthy();
   const checks = {
     database: databaseUp ? 'up' : 'down',
     redis: redisUp ? 'up' : 'down',
+    kafka: kafkaUp ? 'up' : 'down',
   };
 
   if (!databaseUp) return res.status(503).json({ status: 'not_ready', checks });
-  res.json({ status: redisUp ? 'ready' : 'degraded', checks });
+  res.json({ status: redisUp && kafkaUp ? 'ready' : 'degraded', checks });
 });
 
 export default router;

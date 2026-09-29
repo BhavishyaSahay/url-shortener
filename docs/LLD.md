@@ -1,8 +1,8 @@
 # Low-Level Design
 
-Implementation details and the reasoning behind them. Sections are added as each phase is
-built. Still to come: Kafka events (Phase 6).
+Implementation details and the reasoning behind them. For the big picture see [HLD.md](HLD.md).
 
+- [Kafka click events and the analytics worker](#kafka-click-events-and-the-analytics-worker)
 - [Redirect and caching (Redis)](#redirect-and-caching-redis)
 - [Rate limiting](#rate-limiting)
 - [Base62 short codes](#base62-short-codes)
@@ -10,6 +10,150 @@ built. Still to come: Kafka events (Phase 6).
 - [Concurrency: why duplicates are impossible](#concurrency-why-duplicates-are-impossible)
 - [URL management and authorization](#url-management-and-authorization)
 - [Authentication](#authentication)
+
+## Kafka click events and the analytics worker
+
+### The event
+
+Published by the API to topic **`url-clicks`** after every successful `GET` redirect (not `HEAD`):
+
+```json
+{
+  "eventId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+  "urlId": 6,
+  "shortCode": "aB92x",
+  "timestamp": "2026-09-29T17:38:44.207Z",
+  "ipHash": "3b1f0c…(32 hex chars)",
+  "userAgent": "Mozilla/5.0 … Chrome/140.0 …",
+  "referrer": "https://www.twitter.com/post/1"
+}
+```
+
+| Field | Why |
+| ----- | --- |
+| `eventId` | A UUID per click. The worker's **deduplication key** (see idempotency) |
+| `urlId` + `shortCode` | Which link. The worker checks both still match a row, and skips events for deleted links |
+| `ipHash` | `HMAC-SHA256(ip)` with a key derived from `JWT_SECRET`. **The raw IP never leaves the API.** A plain SHA-256 of an IPv4 address can be reversed by hashing all ~4 billion addresses; a keyed HMAC can't be without the secret. Still enough to count unique visitors |
+| `userAgent`, `referrer` | Truncated to 512 and 2048 chars. The worker derives `browser` and the referrer **host** only |
+
+The message **key is the short code**. Kafka picks the partition as `hash(key) % partitions`, so:
+
+- All clicks for one link go to the **same partition**, in order. (Seen in testing: all 5 clicks
+  for code `6` landed in partition 1, offsets 0–4.)
+- One partition is consumed by exactly one worker in the group, so **two workers never update the
+  same link's daily counter concurrently**: no lock contention, no deadlocks between workers.
+- Trade-off: one viral link is limited to one partition's throughput (a *hot partition*). At
+  real scale you'd key by `shortCode + random suffix` and merge the counts.
+
+### Producer: fire-and-forget
+
+```js
+res.redirect(302, url.originalUrl);        // 1. the user gets their response
+void publishClickEvent(buildClickEvent()); // 2. then publish, NOT awaited
+```
+
+- The redirect never waits for Kafka, and a Kafka error can never turn into a failed redirect
+  (`publishClickEvent` never throws).
+- **Not connected, then drop.** Kafka is optional for the API, like Redis: startup doesn't block
+  on it, and `connectProducer()` retries every 5 s in the background.
+- **Backpressure:** if the broker is slow or down, sends pile up while kafkajs retries. Beyond
+  1000 in flight, new events are dropped, so memory can't grow without bound.
+- Drops are logged as a summary (one line per 1000), not once per click. kafkajs's own repeated
+  errors are throttled to one per message per 30 s. Measured during an outage: 2 log lines
+  instead of dozens.
+- **Guarantee: at-most-once.** Events during a Kafka outage are lost, by design: analytics are
+  best-effort and redirects are not. The *transactional outbox* pattern is the upgrade if events
+  must never be lost.
+- `/ready` reports `kafka: down` if the producer isn't connected **or** a send failed in the last
+  30 s. kafkajs stays "connected" while the broker is gone, so failed sends are how we notice.
+
+### Consumer: batches, offsets, idempotency
+
+```text
+poll batch from partition P
+  │
+  ├─ parse + validate each message (zod) ── invalid → log "poison message", skip
+  │
+  ├─ BEGIN
+  │    SELECT id, short_code FROM urls WHERE id IN (…)       -- drop events for deleted links
+  │    INSERT INTO click_events … ON CONFLICT (event_id) DO NOTHING RETURNING url_id, clicked_at
+  │    for each (url, day) among the NEWLY inserted rows, in sorted order:
+  │      INSERT INTO url_daily_stats … ON CONFLICT (url_id, day) DO UPDATE SET clicks = clicks + n
+  │  COMMIT
+  │
+  └─ return normally → kafkajs commits the batch's offsets
+     throw           → nothing committed, the batch is delivered again
+```
+
+**Offsets and delivery semantics.** A consumer group stores, per partition, "processed up to
+offset X". The order of *process* and *commit* decides the guarantee:
+
+| Order | If the worker crashes between the two steps | Guarantee |
+| ----- | ------------------------------------------- | --------- |
+| Commit, then process | Batch never processed | at-most-once (loses data) |
+| **Process, then commit** (used) | Batch processed again after restart | **at-least-once** (duplicates possible) |
+
+At-least-once plus **idempotent processing** gives exactly-once *effects*:
+
+- `click_events.event_id` is `UNIQUE`, so a redelivered event hits `ON CONFLICT DO NOTHING`.
+- The rollup is incremented only from the rows that insert **returned** (the new ones), so a
+  replayed batch adds 0.
+- Raw insert and rollup are in **one transaction**. They can't disagree, and a failure rolls back
+  both.
+- Tested three ways: replaying a whole batch, a partially duplicated batch, and publishing the
+  same event twice through real Kafka. Each click is counted exactly once.
+
+**Why `eachBatch`, not `eachMessage`:** one transaction per batch instead of per click is far
+fewer round trips. With `eachBatchAutoResolve` (the default), a batch is committed only if the
+handler returns.
+
+**Deadlock avoidance:** rollup upserts run in a fixed order (url_id, day). And because of key
+partitioning, two workers never touch the same link's rows anyway.
+
+### Worker lifecycle: "let it crash"
+
+| Situation | Behaviour |
+| --------- | --------- |
+| Startup | Wait for PostgreSQL (retry), then create the topic if missing (idempotent, retry until Kafka answers), then join the group. Unlike the API, the worker genuinely needs both |
+| Transient Kafka/DB error | kafkajs retries (5×, exponential backoff) |
+| Retries exhausted | Consumer **crashes, and the process exits with code 1**. The supervisor (Docker `restart: unless-stopped`, ECS, Kubernetes) starts a fresh process, which resumes from the last committed offset |
+| SIGTERM | `consumer.disconnect()`: finish the batch, commit, leave the group cleanly (partitions reassigned immediately), close the DB pool |
+
+**Why not let kafkajs restart the consumer in-process?** Tested: after a broker restart, kafkajs's
+internal restart hit `The coordinator is loading…`, scheduled another restart, and then **hung
+silently**. It never rejoined the group, so new clicks sat unconsumed in Kafka. Exiting and
+letting a supervisor start a clean process is simpler and more robust. The same test with a
+supervisor loop recovered on its own and counted every post-outage click.
+
+**`sessionTimeout: 10 s`.** A crashed worker can't leave its group politely, so the group only
+reassigns its partitions once heartbeats have been missing for `sessionTimeout`. Measured with
+the 30 s kafkajs default: the restarted worker waited exactly 30 s before consuming. 10 s (with a
+3 s heartbeat) recovers faster, but tolerates less: a batch or GC pause longer than 10 s without
+a heartbeat triggers a rebalance.
+
+### Partitions and scaling
+
+- The topic has **3 partitions**. Consumers in one group split them, so up to 3 worker instances
+  can consume in parallel. A 4th would be idle, and more partitions would be the next step.
+- **Ordering** is guaranteed only *within* a partition. That's all we need, since everything
+  about one link is in one partition.
+- Topics are created deliberately: broker auto-creation is off, and the worker creates
+  `url-clicks` idempotently at startup. A typo in a topic name fails loudly instead of creating a
+  new empty topic.
+
+### Why kafkajs, and its known limits
+
+- Chosen over `@confluentinc/kafka-javascript` (Confluent's maintained client, built on
+  librdkafka): on this machine that package **compiled librdkafka and OpenSSL from C++ source**
+  for several minutes, because there's no prebuilt binary for Node 25 on Apple Silicon. That's
+  heavy for a project meant to be cloned and run, and for Docker and CI builds.
+- kafkajs is pure JavaScript with zero dependencies, and the most widely documented Node client.
+  **Verified against Kafka 4.1**: topic admin, produce, and consumer groups all work.
+- **Caveat:** kafkajs has had no release since February 2023, and its restart logic was the
+  weak spot found above, worked around with "let it crash". It prints a harmless
+  `Timeout duration was set to 1` warning on newer Node versions. The migration path is the
+  Confluent client, which offers a kafkajs-compatible API; the producer, consumer group and
+  `eachBatch` concepts carry over unchanged.
 
 ## Redirect and caching (Redis)
 

@@ -20,6 +20,8 @@ const duration = z
 // message, instead of failing later in the middle of a request.
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  // Appears in every log line, so API and worker logs can be told apart.
+  SERVICE_NAME: z.string().min(1).default('url-shortener-api'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
   LOG_LEVEL: z
     .enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
@@ -35,7 +37,9 @@ const envSchema = z.object({
 
   // Authentication. The secret signs every JWT: anyone who knows it can forge
   // a login for any user, so it must be long, random and never committed.
-  JWT_SECRET: z.string().min(32, 'must be at least 32 characters (generate a random one, see .env.example)'),
+  // Optional here because the analytics worker never signs tokens (it shouldn't
+  // hold the secret: least privilege). The API refuses to start without it (server.js).
+  JWT_SECRET: z.string().min(32, 'must be at least 32 characters (generate a random one, see .env.example)').optional(),
   JWT_EXPIRES_IN: duration.default('1d'),
   // Secure cookies are only sent over HTTPS. Defaults to true in production.
   // (Note: z.coerce.boolean() would turn the string "false" into true; stringbool parses it properly.)
@@ -51,6 +55,16 @@ const envSchema = z.object({
   RATE_LIMIT_LOGIN_WINDOW: duration.default('15m'),
   RATE_LIMIT_CREATE_URL_MAX: z.coerce.number().int().positive().default(30),
   RATE_LIMIT_CREATE_URL_WINDOW: duration.default('1m'),
+
+  // Kafka (click events)
+  KAFKA_BROKERS: z
+    .string()
+    .default('localhost:9092')
+    .transform((value) => value.split(',').map((b) => b.trim()).filter(Boolean)),
+  KAFKA_CLIENT_ID: z.string().default('url-shortener'),
+  KAFKA_CLICKS_TOPIC: z.string().default('url-clicks'),
+  KAFKA_CLICKS_PARTITIONS: z.coerce.number().int().min(1).default(3),
+  KAFKA_CONSUMER_GROUP: z.string().default('analytics-worker'),
 
   // Number of reverse proxies (e.g. Nginx) in front of the app. Express then
   // trusts that many X-Forwarded-For hops when working out req.ip.
@@ -74,6 +88,7 @@ const env = parsed.data;
 
 export const config = Object.freeze({
   env: env.NODE_ENV,
+  serviceName: env.SERVICE_NAME,
   isProduction: env.NODE_ENV === 'production',
   isTest: env.NODE_ENV === 'test',
   port: env.PORT,
@@ -97,6 +112,13 @@ export const config = Object.freeze({
   rateLimit: {
     login: { max: env.RATE_LIMIT_LOGIN_MAX, windowSeconds: env.RATE_LIMIT_LOGIN_WINDOW },
     createUrl: { max: env.RATE_LIMIT_CREATE_URL_MAX, windowSeconds: env.RATE_LIMIT_CREATE_URL_WINDOW },
+  },
+  kafka: {
+    brokers: env.KAFKA_BROKERS,
+    clientId: env.KAFKA_CLIENT_ID,
+    clicksTopic: env.KAFKA_CLICKS_TOPIC,
+    clicksPartitions: env.KAFKA_CLICKS_PARTITIONS,
+    consumerGroup: env.KAFKA_CONSUMER_GROUP,
   },
   trustProxy: env.TRUST_PROXY,
 });
