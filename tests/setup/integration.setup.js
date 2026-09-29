@@ -1,7 +1,12 @@
-import { afterAll } from 'vitest';
+import { afterAll, beforeAll } from 'vitest';
 import { disconnectDatabase } from '../../src/config/database.js';
+import { connectRedis, disconnectRedis } from '../../src/config/redis.js';
 
-// Each test file gets its own connection pool; close it when the file finishes.
+// Each test file gets its own connection pool and Redis client.
+beforeAll(async () => {
+  await connectRedis();
+});
+
 afterAll(async () => {
-  await disconnectDatabase();
+  await Promise.all([disconnectDatabase(), disconnectRedis()]);
 });

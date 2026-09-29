@@ -2,6 +2,7 @@ import { prisma } from '../config/database.js';
 import { encode } from '../utils/base62.js';
 import { ConflictError, NotFoundError, isRecordNotFoundError, isUniqueConstraintError } from '../utils/errors.js';
 import { logger } from '../utils/logger.js';
+import { invalidateUrl } from './urlCache.service.js';
 
 // How many times to retry if a generated code is already taken by a custom
 // alias. Each retry uses a fresh sequence number, so repeated collisions are
@@ -41,7 +42,11 @@ export async function createUrl({ userId, originalUrl, customAlias, expiresAt })
 
   if (customAlias) {
     try {
-      return await prisma.url.create({ data: { ...data, shortCode: customAlias, isCustomAlias: true } });
+      const url = await prisma.url.create({ data: { ...data, shortCode: customAlias, isCustomAlias: true } });
+      // Someone may have visited /<alias> before it existed, leaving a
+      // negative "missing" entry in Redis. Clear it so the new link works immediately.
+      await invalidateUrl(url.shortCode);
+      return url;
     } catch (err) {
       if (isUniqueConstraintError(err)) throw new ConflictError(`The alias "${customAlias}" is already taken`);
       throw err;
@@ -52,7 +57,9 @@ export async function createUrl({ userId, originalUrl, customAlias, expiresAt })
     const id = await reserveNextUrlId();
     const shortCode = encode(id);
     try {
-      return await prisma.url.create({ data: { ...data, id, shortCode } });
+      const url = await prisma.url.create({ data: { ...data, id, shortCode } });
+      await invalidateUrl(url.shortCode); // same as above: clear any negative entry
+      return url;
     } catch (err) {
       if (!isUniqueConstraintError(err)) throw err;
       logger.warn({ id, shortCode, attempt }, 'Generated short code collided with a custom alias, retrying');
@@ -93,24 +100,31 @@ export async function getUrl({ userId, id }) {
   return url;
 }
 
+// Cache invalidation: write to PostgreSQL FIRST, then delete the Redis entry.
+// The next redirect misses and reloads the fresh row. (Deleting instead of
+// overwriting the entry keeps one code path for filling the cache: the redirect.)
+
 export async function updateUrl({ userId, id, changes }) {
+  let url;
   try {
     // One atomic UPDATE … WHERE id = ? AND user_id = ?; no separate
     // "load, check owner, save" steps that another request could interleave with.
-    return await prisma.url.update({ where: { id, userId }, data: changes });
-    // Phase 5: also invalidate the Redis cache entry for this short code.
+    url = await prisma.url.update({ where: { id, userId }, data: changes });
   } catch (err) {
     if (isRecordNotFoundError(err)) throw new NotFoundError('URL not found');
     throw err;
   }
+  await invalidateUrl(url.shortCode);
+  return url;
 }
 
 export async function deleteUrl({ userId, id }) {
+  let url;
   try {
-    await prisma.url.delete({ where: { id, userId } });
-    // Phase 5: also invalidate the Redis cache entry for this short code.
+    url = await prisma.url.delete({ where: { id, userId } }); // returns the deleted row
   } catch (err) {
     if (isRecordNotFoundError(err)) throw new NotFoundError('URL not found');
     throw err;
   }
+  await invalidateUrl(url.shortCode);
 }

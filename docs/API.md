@@ -64,12 +64,14 @@ curl http://localhost:3000/health
 
 ### `GET /ready`: readiness
 
-Can this instance serve traffic? Checks PostgreSQL (Redis and Kafka are added in later phases).
+Can this instance serve traffic? PostgreSQL is **critical**. Redis is **non-critical**: the API
+works without it, just slower and without rate limiting.
 
 | Status | Body |
 | ------ | ---- |
-| 200 | `{ "status": "ready", "checks": { "database": "up" } }` |
-| 503 | `{ "status": "not_ready", "checks": { "database": "down" } }` |
+| 200 | `{ "status": "ready", "checks": { "database": "up", "redis": "up" } }` |
+| 200 | `{ "status": "degraded", "checks": { "database": "up", "redis": "down" } }` |
+| 503 | `{ "status": "not_ready", "checks": { "database": "down", "redis": "…" } }` |
 | 503 | `{ "status": "shutting_down" }` during graceful shutdown |
 
 ---
@@ -115,8 +117,9 @@ curl -i -c cookies.txt -X POST http://localhost:3000/api/v1/auth/login \
 
 **200 OK**: sets the `access_token` cookie. Body: `{ "user": { ... } }`.
 
-Errors: `400` missing fields · `401` `"Invalid email or password"`. The message is the same for
-an unknown email and a wrong password, on purpose. Rate limiting is added in Phase 5.
+Errors: `400` missing fields · `401` `"Invalid email or password"` · `429` too many attempts (see
+[Rate limits](#rate-limits)). The 401 message is the same for an unknown email and a wrong
+password, on purpose.
 
 ### `POST /api/v1/auth/logout`
 
@@ -193,7 +196,8 @@ curl -b cookies.txt -X POST http://localhost:3000/api/v1/urls \
 
 **201 Created**, with a `Location: /api/v1/urls/{id}` header. Body: `{ "url": { ... } }`.
 
-Errors: `400` validation (see `details`) · `401` · `409` alias already taken (by anyone).
+Errors: `400` validation (see `details`) · `401` · `409` alias already taken (by anyone) · `429`
+too many URLs created.
 
 ### `GET /api/v1/urls`
 
@@ -254,6 +258,68 @@ curl -b cookies.txt -X DELETE http://localhost:3000/api/v1/urls/1
 
 ---
 
-## Redirects (Phase 5) · Analytics (Phase 6)
+## Redirects
 
-Documented as each phase is built.
+### `GET /:shortCode`
+
+The public short link. No authentication.
+
+```bash
+curl -i http://localhost:3000/aB92x
+```
+
+**302 Found**
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/products/this-is-a-very-long-url
+X-Cache: HIT
+Cache-Control: private, no-store
+```
+
+| Status | When |
+| ------ | ---- |
+| 302 | Link exists, is active and hasn't expired |
+| 404 `NOT_FOUND` | No such short code, or the path can't be a code (e.g. `favicon.ico`) |
+| 410 `GONE` | Link was deactivated by its owner, or has expired |
+
+`X-Cache` is a debugging aid: `HIT` means served from Redis, `MISS` means read from PostgreSQL
+and now cached, `BYPASS` means Redis was unavailable.
+
+A 302 (temporary) redirect is used rather than a 301 (permanent), because browsers cache 301s
+and would skip the server. Edits, deactivation and click analytics all depend on every click
+reaching the API.
+
+---
+
+## Rate limits
+
+| Endpoint | Limit (default) | Counted per |
+| -------- | --------------- | ----------- |
+| `POST /api/v1/auth/login` | 10 per 15 minutes | IP address **and** email |
+| `POST /api/v1/urls` | 30 per minute | user |
+
+Rate-limited responses include:
+
+```http
+RateLimit-Limit: 10
+RateLimit-Remaining: 0
+RateLimit-Reset: 222
+```
+
+When the limit is exceeded, the response is **429 Too Many Requests**:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 222
+```
+
+```json
+{ "error": { "code": "RATE_LIMITED", "message": "Too many login attempts, please try again later", "requestId": "…" } }
+```
+
+---
+
+## Analytics (Phase 6)
+
+Documented when built.

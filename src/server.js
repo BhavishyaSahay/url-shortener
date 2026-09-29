@@ -1,5 +1,6 @@
 import { config } from './config/env.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
+import { connectRedis, disconnectRedis } from './config/redis.js';
 import { logger } from './utils/logger.js';
 import { createApp } from './app.js';
 
@@ -10,7 +11,8 @@ let server;
 // If PostgreSQL is still starting (common with Docker Compose), connectDatabase
 // retries. The API never listens while pretending the database is available.
 async function start() {
-  await connectDatabase();
+  await connectDatabase(); // required: waits/retries, exits if it never comes up
+  await connectRedis(); // optional: never blocks startup, reconnects in the background
 
   server = app.listen(config.port, () => {
     logger.info({ port: config.port, env: config.env }, 'API server listening');
@@ -55,10 +57,8 @@ async function shutdown(signal) {
 
     // Close external clients only after in-flight requests have finished,
     // because those requests may still need the database.
-    await disconnectDatabase();
-    // Later phases:
-    //   await redis.quit();               (Phase 5)
-    //   await kafkaProducer.disconnect(); (Phase 6)
+    await Promise.all([disconnectDatabase(), disconnectRedis()]);
+    // Phase 6: await kafkaProducer.disconnect();
 
     logger.info('Shutdown complete');
     process.exit(0);

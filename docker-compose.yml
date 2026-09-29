@@ -1,8 +1,8 @@
 # Local development infrastructure.
-# Phase 2: PostgreSQL only. Redis, Kafka, the API, the worker and Nginx are
-# added in later phases.
+# So far: PostgreSQL + Redis. Kafka, the API, the worker and Nginx are added
+# in later phases.
 #
-#   docker compose up -d postgres     start the database
+#   docker compose up -d --wait       start everything, wait until healthy
 #   docker compose ps                 check it is "healthy"
 #   docker compose down               stop (data is kept in the named volume)
 #   docker compose down -v            stop AND delete all data
@@ -30,6 +30,33 @@ services:
       # pg_isready reports healthy only once Postgres accepts connections,
       # not merely when the container process has started.
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    # Redis is used as a CACHE and for rate-limit counters. Nothing in it is
+    # the source of truth, so persistence is off (--save "" --appendonly no):
+    # after a restart the cache simply refills from PostgreSQL.
+    # maxmemory + allkeys-lru: when full, evict the least-recently-used keys
+    # instead of erroring, which is exactly what a cache should do.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - allkeys-lru
+    ports:
+      # Host port 6380 avoids clashing with a locally installed Redis on 6379.
+      - "127.0.0.1:${REDIS_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10

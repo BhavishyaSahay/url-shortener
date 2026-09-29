@@ -29,10 +29,10 @@ describe('GET /health', () => {
 });
 
 describe('GET /ready', () => {
-  it('returns 200 when PostgreSQL is reachable', async () => {
+  it('returns 200 "ready" when PostgreSQL and Redis are reachable', async () => {
     const res = await request(createApp()).get('/ready');
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ status: 'ready', checks: { database: 'up' } });
+    expect(res.body).toEqual({ status: 'ready', checks: { database: 'up', redis: 'up' } });
   });
 
   it('returns 503 during graceful shutdown so load balancers stop sending traffic', async () => {

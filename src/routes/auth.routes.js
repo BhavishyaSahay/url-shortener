@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import * as authController from '../controllers/auth.controller.js';
 import { requireAuth } from '../middleware/auth.middleware.js';
+import { loginRateLimit } from '../middleware/rateLimiter.middleware.js';
 
 const router = Router();
 
@@ -12,7 +13,7 @@ router.use((req, res, next) => {
 });
 
 router.post('/register', authController.register);
-router.post('/login', authController.login); // Redis rate limit added in Phase 5
+router.post('/login', loginRateLimit, authController.login);
 router.post('/logout', authController.logout);
 router.get('/me', requireAuth, authController.me);
 

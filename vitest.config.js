@@ -1,5 +1,5 @@
 import { defineConfig } from 'vitest/config';
-import { TEST_DATABASE_URL } from './tests/setup/test-database.js';
+import { TEST_DATABASE_URL, TEST_REDIS_URL } from './tests/setup/test-database.js';
 
 export default defineConfig({
   test: {
@@ -12,6 +12,12 @@ export default defineConfig({
       // Fixed, test-only secret (never used outside tests).
       JWT_SECRET: 'test-only-jwt-secret-at-least-32-characters-long',
       JWT_EXPIRES_IN: '1d',
+      REDIS_URL: TEST_REDIS_URL,
+      // Small limits so tests can reach them quickly.
+      RATE_LIMIT_LOGIN_MAX: '5',
+      RATE_LIMIT_LOGIN_WINDOW: '15m',
+      RATE_LIMIT_CREATE_URL_MAX: '50',
+      RATE_LIMIT_CREATE_URL_WINDOW: '1m',
     },
     projects: [
       {

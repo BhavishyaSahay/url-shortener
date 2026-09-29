@@ -1,13 +1,187 @@
 # Low-Level Design
 
 Implementation details and the reasoning behind them. Sections are added as each phase is
-built. Still to come: caching and rate limiting (Phase 5), Kafka events (Phase 6).
+built. Still to come: Kafka events (Phase 6).
 
+- [Redirect and caching (Redis)](#redirect-and-caching-redis)
+- [Rate limiting](#rate-limiting)
 - [Base62 short codes](#base62-short-codes)
 - [Short-code generation and collision handling](#short-code-generation-and-collision-handling)
 - [Concurrency: why duplicates are impossible](#concurrency-why-duplicates-are-impossible)
 - [URL management and authorization](#url-management-and-authorization)
 - [Authentication](#authentication)
+
+## Redirect and caching (Redis)
+
+### Redirect flow: `GET /:shortCode`
+
+```text
+GET /aB92x
+  │
+  ├─ matches ^[A-Za-z0-9_-]{1,32}$ ? ── no ──────────────────────────────────► 404 (no Redis/DB work)
+  │
+  ├─ Redis GET url:aB92x
+  │     ├─ HIT  {id, originalUrl, isActive, expiresAt} ───────────────┐
+  │     ├─ HIT  {missing: true}  (negative cache) ────────────────────┤
+  │     ├─ MISS ─► PostgreSQL SELECT … WHERE short_code = 'aB92x'     │
+  │     │            └─► Redis SET url:aB92x <json> EX <ttl> ─────────┤
+  │     └─ BYPASS (Redis down) ─► PostgreSQL, don't cache ────────────┤
+  │                                                                   ▼
+  ├─ not found ──────────────────────────────────────────────────────────────► 404
+  ├─ isActive = false ───────────────────────────────────────────────────────► 410 Gone
+  ├─ expiresAt ≤ now ────────────────────────────────────────────────────────► 410 Gone
+  └─ 302 Found, Location: <originalUrl>, X-Cache: HIT|MISS|BYPASS, Cache-Control: private, no-store
+```
+
+### Cache-aside (lazy loading)
+
+The **application** owns the cache logic. Redis never talks to PostgreSQL:
+
+1. **Read:** try Redis. On a miss, read PostgreSQL, then write the result into Redis.
+2. **Write** (create/update/delete): write PostgreSQL, then **delete** the Redis key. The next
+   read repopulates it.
+
+Why this pattern:
+
+- Only links that are actually clicked use memory. A link created and never visited is never
+  cached.
+- If Redis loses everything (restart, eviction, outage), the only effect is extra misses.
+  **PostgreSQL stays the source of truth.**
+- Alternatives: *write-through* (update the cache on every write) fills memory with never-read
+  links and needs two writes to stay consistent. *Read-through* needs a cache that can load from
+  the DB itself, which Redis can't.
+
+**Why delete on write instead of overwriting the cached value?** One code path fills the cache
+(the redirect), so there's a single place that decides what a cache entry looks like. Deleting
+is also idempotent and safe to retry.
+
+### What is cached
+
+| Key | Value | TTL |
+| --- | ----- | --- |
+| `url:<shortCode>` | `{"id":4,"originalUrl":"https://…","isActive":true,"expiresAt":null}` | `URL_CACHE_TTL` (1 h) |
+| `url:<shortCode>` | `{"missing":true}`: code doesn't exist | `URL_NEGATIVE_CACHE_TTL` (60 s) |
+
+- **The decision fields, not just the URL.** `expiresAt` is re-checked on every hit, so a cached
+  link stops working at the exact second it expires, whatever the cache TTL. (A test fakes the
+  clock to prove this.) `id` is carried along for the Phase 6 click events.
+- **TTL (time to live):** Redis deletes the key automatically after N seconds. The TTL is the
+  safety net for every consistency problem below: whatever goes wrong, a stale entry lives at
+  most one TTL. Shorter TTL means fresher data but more DB reads; 1 hour suits links, which
+  rarely change.
+- **Negative caching** protects PostgreSQL from repeated lookups of codes that don't exist (bots
+  scanning `/aaaa`, `/aaab` …; this is called *cache penetration*). It uses a short TTL, and
+  creating a link deletes the key, so a newly created alias works immediately. There's a test
+  for that too.
+- **Memory:** Redis runs with `maxmemory 128mb` and `allkeys-lru`. When full it evicts the
+  least-recently-used keys instead of rejecting writes, which is exactly right for a cache.
+  Persistence is off: there's nothing worth saving.
+
+### Consistency: the known race
+
+Cache-aside with delete-on-write has one classic race:
+
+```text
+Reader                                 Writer
+GET url:x → MISS
+SELECT … → old row
+                                       UPDATE row
+                                       DEL url:x
+SET url:x = old row   ← stale entry written AFTER the delete
+```
+
+The stale entry survives until its TTL. It needs a miss and an update to interleave within
+milliseconds, and the damage is bounded by the TTL, so it's accepted here. Stricter fixes exist
+(delayed double-delete, versioned values) but aren't worth the complexity for link edits. One
+more case: deleting a user cascades to their URLs in the database without touching Redis. There
+is no delete-account endpoint yet; if one is added, it must invalidate each of that user's codes.
+
+### Failure handling: Redis is optional
+
+| Situation | Behaviour |
+| --------- | --------- |
+| Redis down at startup | API starts anyway (`connectRedis()` never throws). ioredis reconnects in the background |
+| Redis goes down while running | `status !== 'ready'`, so every cache call returns `BYPASS` immediately and reads go to PostgreSQL. `enableOfflineQueue: false` means commands fail instantly instead of queueing |
+| Redis slow / hanging | `commandTimeout: 500` ms, then treated as a miss |
+| Redis comes back | ioredis reconnects (backoff up to 5 s). The cache refills on demand |
+| `/ready` | `200 {"status":"degraded"}`, **not** 503. Taking every instance out of the load balancer because the *cache* is down would turn "slower" into "down" |
+| Logs | One warning when Redis becomes unavailable, then at most one every 30 s |
+
+Measured on this machine (single `curl`, not a benchmark): a redirect with Redis stopped took
+about 13 ms. Real throughput and latency numbers come from the Phase 11 k6 load tests.
+
+### Why 302 and not 301
+
+| | 301 Moved Permanently | 302 Found (used) |
+| - | - | - |
+| Browser behaviour | Caches the redirect, possibly forever, and goes straight to the destination next time | Asks our server every time |
+| Deactivate / edit a link | Doesn't reach users who already visited | Takes effect immediately |
+| Analytics (Phase 6) | Repeat clicks never reach us | Every click is counted |
+| Load on our server | Lower | Higher, which is why the cache matters |
+
+`Cache-Control: private, no-store` keeps proxies and browsers from caching the redirect.
+
+## Rate limiting
+
+### Algorithm: fixed window counter
+
+```text
+window = floor(now / windowLength)            e.g. 15-minute blocks
+key    = rl:<limiter>:<client>:<window>       e.g. rl:login:ip:203.0.113.7:1932117
+
+MULTI
+  INCR   key          → 1, 2, 3 …
+  EXPIRE key <window>   so old counters delete themselves
+EXEC
+
+count > max ?  → 429 Too Many Requests + Retry-After: <seconds until window ends>
+```
+
+- **INCR is atomic.** Two simultaneous requests can never both read 9 and both write 10. A test
+  fires 60 concurrent URL creations against a limit of 50 and gets exactly 50 × 201 and 10 × 429.
+- **MULTI/EXEC** runs INCR and EXPIRE as a unit, so a counter is never left without an expiry.
+- **Redis, not process memory:** with two API instances, per-process counters would allow
+  2 × max. Redis is shared by every instance.
+- **Headers:** `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`, and `Retry-After` on
+  429.
+
+### Limits
+
+| Endpoint | Counted per | Default | Why |
+| -------- | ----------- | ------- | --- |
+| `POST /auth/login` | client **IP** | 10 / 15 min | One machine trying many accounts (credential stuffing) |
+| `POST /auth/login` | **email** (SHA-256 hashed in the key) | 10 / 15 min | Many machines guessing one account's password |
+| `POST /urls` | **user ID** | 30 / min | Spam and abuse of link creation |
+
+All values are configurable via `RATE_LIMIT_*` env vars. Once limited, even the **correct**
+password gets 429, so an attacker can't use the limiter to confirm a guess.
+
+### Trade-offs of the algorithm
+
+| Algorithm | How | Pros | Cons |
+| --------- | --- | ---- | ---- |
+| **Fixed window** (used) | One counter per time block | Simplest; 1 key and 2 commands per request; easy to explain | **Boundary burst:** max requests at 11:59:59 plus max at 12:00:00 is 2× max in two seconds |
+| Sliding window log | Sorted set of every request's timestamp | Exact | Memory grows with request count |
+| Sliding window counter | Weighted mix of current and previous window | Smooths the boundary, still cheap | Approximate; a bit more logic |
+| Token bucket | Tokens refill at a steady rate, each request spends one | Allows short bursts but enforces an average rate | Needs a Lua script for atomic refill-and-take |
+
+For login protection the boundary burst is acceptable: 20 guesses instead of 10 around one
+boundary doesn't change the security picture. If URL creation ever needed smooth limits, a
+token bucket in a small Lua script would be the next step.
+
+### Failure mode: fail open
+
+If Redis is down, the limiter **allows** the request (and logs a warning). The alternative, fail
+closed, would lock every user out of login during a cache outage. The trade-off is weaker
+brute-force protection during the outage. An in-memory per-instance fallback limiter would be
+a reasonable middle ground later.
+
+### Client IP behind a proxy
+
+Behind Nginx, every request arrives from Nginx's IP, so all users would share one rate-limit
+counter. `TRUST_PROXY=1` tells Express to take `req.ip` from the last hop in `X-Forwarded-For`.
+It must equal the real number of proxies: trusting the header without a proxy lets any client
+forge its IP and dodge the limit.
 
 ## Base62 short codes
 

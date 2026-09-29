@@ -6,6 +6,8 @@ import { pinoHttp } from 'pino-http';
 import { logger } from './utils/logger.js';
 import healthRoutes from './routes/health.routes.js';
 import v1Router from './routes/index.js';
+import redirectRoutes from './routes/redirect.routes.js';
+import { config } from './config/env.js';
 import { errorHandler, notFoundHandler } from './middleware/error.middleware.js';
 
 // Infrastructure endpoints that are polled constantly (by Docker health checks,
@@ -17,6 +19,11 @@ const QUIET_PATHS = new Set(['/health', '/ready', '/metrics']);
 // opening a real port.
 export function createApp() {
   const app = express();
+
+  // Behind Nginx, every request arrives from Nginx's IP. Trusting N proxy hops
+  // makes req.ip the real client IP from X-Forwarded-For, which the rate
+  // limiter depends on. (Trusting it without a proxy would let clients spoof their IP.)
+  app.set('trust proxy', config.trustProxy);
 
   // Security headers (X-Content-Type-Options, removes X-Powered-By, etc.)
   app.use(helmet());
@@ -51,10 +58,11 @@ export function createApp() {
   // Parse the Cookie header into req.cookies (the auth token lives in a cookie).
   app.use(cookieParser());
 
-  // Route order matters: fixed paths are registered first. In Phase 5 the
-  // catch-all redirect route GET /:shortCode goes last, so it can't shadow them.
+  // Route order matters: fixed paths first, then the catch-all short-link
+  // route GET /:shortCode last, so it can't shadow /health, /ready or /api.
   app.use(healthRoutes);
   app.use('/api/v1', v1Router);
+  app.use(redirectRoutes);
 
   app.use(notFoundHandler);
   app.use(errorHandler);

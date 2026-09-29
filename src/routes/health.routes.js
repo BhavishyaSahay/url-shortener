@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { isDatabaseHealthy } from '../config/database.js';
+import { isRedisHealthy } from '../config/redis.js';
 
 const router = Router();
 
@@ -16,9 +17,16 @@ router.get('/health', (req, res) => {
 });
 
 // Readiness check: "should this instance receive traffic right now?"
-// Checks the dependencies a request needs. A load balancer (Nginx/AWS) stops
-// routing to an instance that returns 503 here, but does not restart it.
-// Redis (Phase 5) and Kafka (Phase 6) checks are added here later.
+// A load balancer (Nginx/AWS) stops routing to an instance that returns 503
+// here, but does not restart it.
+//
+// Dependencies are split into two kinds:
+//   critical      PostgreSQL: without it we can't serve anything → 503
+//   non-critical  Redis: we still work without it (slower, no rate limiting)
+//                 → 200 "degraded". Failing readiness here would pull EVERY
+//                 instance out of rotation during a cache outage, turning
+//                 "slower" into "completely down".
+// Kafka (Phase 6) will be non-critical too: redirects must not depend on analytics.
 router.get('/ready', async (req, res) => {
   // During graceful shutdown, report not-ready so traffic drains away
   // before the process exits.
@@ -26,12 +34,14 @@ router.get('/ready', async (req, res) => {
     return res.status(503).json({ status: 'shutting_down' });
   }
 
+  const [databaseUp, redisUp] = await Promise.all([isDatabaseHealthy(), isRedisHealthy()]);
   const checks = {
-    database: (await isDatabaseHealthy()) ? 'up' : 'down',
+    database: databaseUp ? 'up' : 'down',
+    redis: redisUp ? 'up' : 'down',
   };
-  const ready = Object.values(checks).every((status) => status === 'up');
 
-  res.status(ready ? 200 : 503).json({ status: ready ? 'ready' : 'not_ready', checks });
+  if (!databaseUp) return res.status(503).json({ status: 'not_ready', checks });
+  res.json({ status: redisUp ? 'ready' : 'degraded', checks });
 });
 
 export default router;

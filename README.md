@@ -16,7 +16,7 @@ The project is built in phases, and each one is verified before the next starts.
 | 2 | PostgreSQL + Prisma schema, migrations, indexes, `/ready` | ✅ Done |
 | 3 | Authentication: Argon2id, JWT in HTTP-only cookies | ✅ Done |
 | 4 | URL shortening: Base62, custom aliases, expiry, CRUD with ownership checks | ✅ Done |
-| 5 | Redirects, Redis cache-aside, rate limiting | ⏳ |
+| 5 | Redirects, Redis cache-aside, negative caching, fixed-window rate limiting | ✅ Done |
 | 6 | Kafka click events + analytics worker | ⏳ |
 | 7 | Docker, Docker Compose, Nginx | ⏳ |
 | 8 | CI/CD with GitHub Actions | ⏳ |
@@ -33,18 +33,19 @@ cp .env.example .env
 # set JWT_SECRET in .env (required, 32+ chars):
 node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"
 npm install          # also generates the Prisma client (postinstall)
-npm run db:up        # start PostgreSQL in Docker and wait until it's healthy
+npm run db:up        # start PostgreSQL + Redis in Docker, wait until healthy
 npm run db:migrate   # apply database migrations
 npm run dev          # start the API with auto-reload
 ```
 
 ```bash
 curl http://localhost:3000/health   # liveness: is the process up?
-curl http://localhost:3000/ready    # readiness: can it reach PostgreSQL?
+curl http://localhost:3000/ready    # readiness: PostgreSQL (critical) + Redis (optional)
 ```
 
-PostgreSQL is published on host port **5433** (not 5432) to avoid clashing with a locally
-installed Postgres. Change `POSTGRES_PORT` and `DATABASE_URL` in `.env` if needed.
+Containers are published on non-default host ports to avoid clashing with locally installed
+services: **PostgreSQL on 5433** and **Redis on 6380**. Change `POSTGRES_PORT`/`DATABASE_URL`
+and `REDIS_PORT`/`REDIS_URL` in `.env` if needed.
 
 ## Scripts
 
@@ -55,8 +56,8 @@ installed Postgres. Change `POSTGRES_PORT` and `DATABASE_URL` in `.env` if neede
 | `npm run lint` | Run ESLint |
 | `npm test` | Run all tests |
 | `npm run test:unit` | Unit tests only |
-| `npm run test:integration` | Integration tests (need PostgreSQL running; use a separate `_test` DB) |
-| `npm run db:up` | Start PostgreSQL (Docker) and wait for its health check |
+| `npm run test:integration` | Integration tests (need PostgreSQL + Redis running; use a separate `_test` DB and Redis DB 1) |
+| `npm run db:up` | Start PostgreSQL + Redis (Docker) and wait for their health checks |
 | `npm run db:migrate` | Create/apply migrations in development |
 | `npm run db:deploy` | Apply pending migrations (CI/production) |
 | `npm run db:studio` | Browse the database in Prisma Studio |
@@ -82,5 +83,5 @@ docs/           HLD, LLD, API, DATABASE, DEVOPS
 ## Documentation
 
 - [docs/API.md](docs/API.md): endpoints with curl examples
-- [docs/LLD.md](docs/LLD.md): low-level design (Base62, collisions, concurrency, authorization, authentication)
+- [docs/LLD.md](docs/LLD.md): low-level design (caching, rate limiting, Base62, collisions, concurrency, auth)
 - [docs/DATABASE.md](docs/DATABASE.md): schema, indexes, constraints, pooling

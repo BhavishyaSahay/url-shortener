@@ -40,6 +40,21 @@ const envSchema = z.object({
   // Secure cookies are only sent over HTTPS. Defaults to true in production.
   // (Note: z.coerce.boolean() would turn the string "false" into true; stringbool parses it properly.)
   COOKIE_SECURE: z.stringbool().optional(),
+
+  // Redis (cache + rate-limit counters)
+  REDIS_URL: z.url({ protocol: /^rediss?$/, error: 'must be a redis:// URL' }).default('redis://localhost:6380/0'),
+  URL_CACHE_TTL: duration.default('1h'),
+  URL_NEGATIVE_CACHE_TTL: duration.default('60s'),
+
+  // Rate limiting (fixed window)
+  RATE_LIMIT_LOGIN_MAX: z.coerce.number().int().positive().default(10),
+  RATE_LIMIT_LOGIN_WINDOW: duration.default('15m'),
+  RATE_LIMIT_CREATE_URL_MAX: z.coerce.number().int().positive().default(30),
+  RATE_LIMIT_CREATE_URL_WINDOW: duration.default('1m'),
+
+  // Number of reverse proxies (e.g. Nginx) in front of the app. Express then
+  // trusts that many X-Forwarded-For hops when working out req.ip.
+  TRUST_PROXY: z.coerce.number().int().min(0).default(0),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -74,4 +89,14 @@ export const config = Object.freeze({
     jwtExpiresInSeconds: env.JWT_EXPIRES_IN,
     cookieSecure: env.COOKIE_SECURE ?? env.NODE_ENV === 'production',
   },
+  redis: {
+    url: env.REDIS_URL,
+    urlCacheTtlSeconds: env.URL_CACHE_TTL,
+    negativeCacheTtlSeconds: env.URL_NEGATIVE_CACHE_TTL,
+  },
+  rateLimit: {
+    login: { max: env.RATE_LIMIT_LOGIN_MAX, windowSeconds: env.RATE_LIMIT_LOGIN_WINDOW },
+    createUrl: { max: env.RATE_LIMIT_CREATE_URL_MAX, windowSeconds: env.RATE_LIMIT_CREATE_URL_WINDOW },
+  },
+  trustProxy: env.TRUST_PROXY,
 });
