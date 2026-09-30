@@ -183,11 +183,19 @@ jobs:
           cache-from: type=gha,scope=migrate
           cache-to: type=gha,mode=max,scope=migrate
 
-      - name: Start the full stack
-        # A throwaway secret, generated per run: the stack refuses to start without one.
+      # A throwaway secret, generated per run: compose refuses to even parse the
+      # file without one, and that includes `logs` and `down`. Every step runs in
+      # a NEW shell, so a plain `export` would be gone by the next step. Writing
+      # it to $GITHUB_ENV makes it available to all later steps, and add-mask
+      # hides the value from the logs.
+      - name: Generate a throwaway JWT secret
         run: |
-          JWT_SECRET="$(openssl rand -base64 48)"
-          export JWT_SECRET
+          secret="$(openssl rand -base64 48)"
+          echo "::add-mask::$secret"
+          echo "JWT_SECRET=$secret" >> "$GITHUB_ENV"
+
+      - name: Start the full stack
+        run: |
           docker compose up -d --no-build --wait
           docker compose ps
 
