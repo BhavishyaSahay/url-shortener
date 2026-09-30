@@ -16,7 +16,9 @@
 #
 # Required variables: see .env.production.example
 
-name: url-shortener
+# Different project name from docker-compose.yml, so production commands can
+# never touch (or --remove-orphans) development containers on the same machine.
+name: url-shortener-prod
 
 x-logging: &default-logging
   driver: json-file

@@ -1,0 +1,224 @@
+# Continuous Deployment:
+#
+#   push to main ──► CI (ci.yml) ──✗──► stop, nothing is published
+#                        │ ✓
+#                        ▼
+#   publish: build images → push to GitHub Container Registry, tagged with the git SHA
+#                        │
+#                        ▼
+#   deploy:  copy compose files to EC2 → pull images → migrate → restart
+#            → health check → roll back automatically if unhealthy
+#
+# Manual runs (Actions tab → CD → Run workflow):
+#   - no input:          build and deploy the current main
+#   - image_tag = <sha>: redeploy an image that already exists, e.g. to ROLL BACK
+#
+# The deploy job only runs once the repository variable DEPLOY_ENABLED is
+# "true" (set up with the EC2 server in Phase 9). Until then CD still builds
+# and publishes images.
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Existing image tag (full git SHA) to deploy, e.g. to roll back. Leave empty to build and deploy the current main."
+        required: false
+        default: ""
+
+# One deployment at a time. A running deployment is never cancelled halfway;
+# the next one waits in line.
+concurrency:
+  group: cd-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Build & push images
+    # Only after CI SUCCEEDED for a PUSH to main (never for pull requests or
+    # failed runs), or for a manual run that didn't name an existing tag.
+    if: >-
+      (github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.event == 'push')
+      || (github.event_name == 'workflow_dispatch' && inputs.image_tag == '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write           # push to ghcr.io with the built-in GITHUB_TOKEN
+    outputs:
+      image_tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Build exactly the commit that CI tested, even if main moved on since.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Compute image names
+        id: vars
+        run: |
+          # Registry paths must be lowercase; GitHub usernames may not be.
+          echo "prefix=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/url-shortener" >> "$GITHUB_OUTPUT"
+          echo "tag=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}   # short-lived, scoped to this run
+
+      # Each image gets two tags:
+      #   :<git sha>  immutable; exactly identifies what's deployed; used for rollbacks
+      #   :latest     convenience pointer to the newest main build
+      - name: Build & push API image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/api.Dockerfile
+          target: runtime
+          platforms: linux/amd64    # EC2 t3 instances are x86_64
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.prefix }}-api:${{ steps.vars.outputs.tag }}
+            ${{ steps.vars.outputs.prefix }}-api:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build & push worker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/worker.Dockerfile
+          target: runtime
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.prefix }}-worker:${{ steps.vars.outputs.tag }}
+            ${{ steps.vars.outputs.prefix }}-worker:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
+
+      - name: Build & push migrate image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/api.Dockerfile
+          target: migrate
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.prefix }}-migrate:${{ steps.vars.outputs.tag }}
+            ${{ steps.vars.outputs.prefix }}-migrate:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.vars.outputs.tag }}
+          cache-from: type=gha,scope=migrate
+          cache-to: type=gha,mode=max,scope=migrate
+
+      - name: Summary
+        run: |
+          {
+            echo "### Published images"
+            echo "| Image | Tag |"
+            echo "| --- | --- |"
+            for name in api worker migrate; do
+              echo "| \`${{ steps.vars.outputs.prefix }}-$name\` | \`${{ steps.vars.outputs.tag }}\` |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to AWS EC2
+    needs: publish
+    # always(): evaluate even when `publish` was skipped (manual rollback run).
+    if: >-
+      always()
+      && vars.DEPLOY_ENABLED == 'true'
+      && (needs.publish.result == 'success'
+        || (needs.publish.result == 'skipped'
+          && github.event_name == 'workflow_dispatch'
+          && inputs.image_tag != ''))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # A GitHub "environment": holds the production secrets, records every
+    # deployment, and can require a manual approval before this job runs.
+    environment:
+      name: production
+      url: ${{ vars.APP_BASE_URL }}
+    permissions:
+      contents: read
+      packages: read            # lets the server pull images with this run's token
+    env:
+      IMAGE_TAG: ${{ needs.publish.outputs.image_tag || inputs.image_tag }}
+      DEPLOY_DIR: /opt/url-shortener
+      SSH_TARGET: ${{ vars.EC2_USER }}@${{ vars.EC2_HOST }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Deploy the compose/nginx files that belong to the deployed version.
+          ref: ${{ env.IMAGE_TAG }}
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.EC2_SSH_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          # Pinned host key: the connection fails if the server's identity ever
+          # changes, rather than blindly trusting whoever answers (a MITM).
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host deploy-target
+            HostName ${{ vars.EC2_HOST }}
+            User ${{ vars.EC2_USER }}
+            IdentityFile ~/.ssh/deploy_key
+            StrictHostKeyChecking yes
+          EOF
+
+      - name: Copy deployment files to the server
+        # $DEPLOY_DIR is expanded here on the runner, on purpose (SC2029).
+        run: |
+          # shellcheck disable=SC2029
+          ssh deploy-target "mkdir -p '$DEPLOY_DIR/nginx'"
+          scp docker-compose.prod.yml infrastructure/aws/deploy.sh "deploy-target:$DEPLOY_DIR/"
+          scp nginx/nginx.conf "deploy-target:$DEPLOY_DIR/nginx/"
+
+      - name: Log the server in to the registry
+        # The token is piped over stdin (never on a command line, so it can't
+        # show up in process lists or logs) and expires when this run ends,
+        # so no long-lived registry credential is stored on the server.
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | ssh deploy-target "docker login ghcr.io -u ${{ github.actor }} --password-stdin"
+
+      - name: Deploy
+        run: |
+          # shellcheck disable=SC2029  # expanded on the runner, on purpose
+          ssh deploy-target "cd '$DEPLOY_DIR' && chmod +x deploy.sh && ./deploy.sh '$IMAGE_TAG'"
+
+      - name: Log the server out of the registry
+        if: always()
+        run: ssh deploy-target "docker logout ghcr.io" || true
+
+      - name: Smoke test (read-only) against production
+        run: scripts/smoke-test.sh "${{ vars.APP_BASE_URL }}" --read-only
+
+      - name: Summary
+        run: echo "### Deployed \`$IMAGE_TAG\` to ${{ vars.APP_BASE_URL }}" >> "$GITHUB_STEP_SUMMARY"

@@ -21,6 +21,7 @@ coverage
 logs
 *.log
 infrastructure
+scripts
 nginx
 docker-compose*.yml
 docker

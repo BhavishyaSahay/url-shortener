@@ -1,5 +1,8 @@
 # URL Shortener
 
+[![CI](https://github.com/BhavishyaSahay/url-shortener/actions/workflows/ci.yml/badge.svg)](https://github.com/BhavishyaSahay/url-shortener/actions/workflows/ci.yml)
+[![CD](https://github.com/BhavishyaSahay/url-shortener/actions/workflows/cd.yml/badge.svg)](https://github.com/BhavishyaSahay/url-shortener/actions/workflows/cd.yml)
+
 A scalable URL shortener (a simplified Bitly) built as a final-year CS project to show backend
 engineering and the basics of deploying, monitoring and operating a service.
 
@@ -19,7 +22,7 @@ The project is built in phases, and each one is verified before the next starts.
 | 5 | Redirects, Redis cache-aside, negative caching, fixed-window rate limiting | ✅ Done |
 | 6 | Kafka click events, analytics worker (idempotent, batched), analytics API | ✅ Done |
 | 7 | Docker (multi-stage, non-root), Compose (dev + prod), Nginx load balancing | ✅ Done |
-| 8 | CI/CD with GitHub Actions | ⏳ |
+| 8 | CI (lint, audit, unit, integration, Docker smoke test), CD (GHCR images, SSH deploy, auto-rollback) | ✅ Done |
 | 9 | AWS EC2 deployment | ⏳ |
 | 10 | Prometheus + Grafana monitoring | ⏳ |
 | 11 | k6 load testing | ⏳ |
@@ -97,6 +100,9 @@ src/
 prisma/         schema.prisma + SQL migrations
 worker/         analytics worker: Kafka consumer → PostgreSQL (separate process)
 docker/         multi-stage Dockerfiles (api, worker)
+.github/        CI and CD workflows, Dependabot
+scripts/        smoke test (used by CI and CD)
+infrastructure/ deployment script run on the server
 nginx/          reverse proxy / load balancer config
 tests/          unit/, integration/, load/ (k6)
 docs/           HLD, LLD, API, DATABASE, DEVOPS
@@ -108,4 +114,4 @@ docs/           HLD, LLD, API, DATABASE, DEVOPS
 - [docs/API.md](docs/API.md): endpoints with curl examples
 - [docs/LLD.md](docs/LLD.md): low-level design (Kafka, caching, rate limiting, Base62, concurrency, auth)
 - [docs/DATABASE.md](docs/DATABASE.md): schema, indexes, constraints, pooling
-- [docs/DEVOPS.md](docs/DEVOPS.md): Docker images, Compose, networking, Nginx, health checks, secrets
+- [docs/DEVOPS.md](docs/DEVOPS.md): Docker, Compose, Nginx, CI/CD pipelines, deploys and rollbacks, secrets
