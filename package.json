@@ -19,7 +19,10 @@
     "db:reset": "prisma migrate reset",
     "postinstall": "prisma generate",
     "worker": "SERVICE_NAME=analytics-worker node worker/analytics.worker.js",
-    "worker:dev": "SERVICE_NAME=analytics-worker node --watch worker/analytics.worker.js"
+    "worker:dev": "SERVICE_NAME=analytics-worker node --watch worker/analytics.worker.js",
+    "docker:up": "docker compose up -d --build --wait",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f api worker nginx"
   },
   "license": "MIT",
   "type": "module",

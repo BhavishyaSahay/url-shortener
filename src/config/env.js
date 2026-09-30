@@ -6,19 +6,26 @@ import { z } from 'zod';
 dotenv.config({ quiet: true });
 
 // "15m" / "12h" / "7d" / "3600" (plain seconds) -> number of seconds.
+// Defaults for these MUST use .prefault(), not .default(): in Zod 4, .default()
+// returns its value as-is WITHOUT running the transform, so an unset variable
+// would become the string '1d' instead of 86400. (Found when the app first ran
+// in Docker, where these variables aren't set.) .prefault() feeds the default
+// through the schema like a real value.
 const DURATION_UNITS = { s: 1, m: 60, h: 3600, d: 86_400 };
 const duration = z
   .string()
   .regex(/^\d+[smhd]?$/, 'must look like 3600, 30s, 15m, 12h or 7d')
   .transform((value) => {
-    const [, amount, unit = 's'] = value.match(/^(\d+)([smhd]?)$/);
-    return Number(amount) * DURATION_UNITS[unit];
+    // The unit group matches '' (not undefined) when absent, so a destructuring
+    // default wouldn't apply; `|| 's'` treats a bare number as seconds.
+    const [, amount, unit] = value.match(/^(\d+)([smhd]?)$/);
+    return Number(amount) * DURATION_UNITS[unit || 's'];
   });
 
 // Every environment variable the app reads is declared and validated here.
 // If something is missing or malformed we crash at startup with a clear
 // message, instead of failing later in the middle of a request.
-const envSchema = z.object({
+export const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   // Appears in every log line, so API and worker logs can be told apart.
   SERVICE_NAME: z.string().min(1).default('url-shortener-api'),
@@ -40,21 +47,21 @@ const envSchema = z.object({
   // Optional here because the analytics worker never signs tokens (it shouldn't
   // hold the secret: least privilege). The API refuses to start without it (server.js).
   JWT_SECRET: z.string().min(32, 'must be at least 32 characters (generate a random one, see .env.example)').optional(),
-  JWT_EXPIRES_IN: duration.default('1d'),
+  JWT_EXPIRES_IN: duration.prefault('1d'),
   // Secure cookies are only sent over HTTPS. Defaults to true in production.
   // (Note: z.coerce.boolean() would turn the string "false" into true; stringbool parses it properly.)
   COOKIE_SECURE: z.stringbool().optional(),
 
   // Redis (cache + rate-limit counters)
   REDIS_URL: z.url({ protocol: /^rediss?$/, error: 'must be a redis:// URL' }).default('redis://localhost:6380/0'),
-  URL_CACHE_TTL: duration.default('1h'),
-  URL_NEGATIVE_CACHE_TTL: duration.default('60s'),
+  URL_CACHE_TTL: duration.prefault('1h'),
+  URL_NEGATIVE_CACHE_TTL: duration.prefault('60s'),
 
   // Rate limiting (fixed window)
   RATE_LIMIT_LOGIN_MAX: z.coerce.number().int().positive().default(10),
-  RATE_LIMIT_LOGIN_WINDOW: duration.default('15m'),
+  RATE_LIMIT_LOGIN_WINDOW: duration.prefault('15m'),
   RATE_LIMIT_CREATE_URL_MAX: z.coerce.number().int().positive().default(30),
-  RATE_LIMIT_CREATE_URL_WINDOW: duration.default('1m'),
+  RATE_LIMIT_CREATE_URL_WINDOW: duration.prefault('1m'),
 
   // Kafka (click events)
   KAFKA_BROKERS: z
@@ -65,6 +72,8 @@ const envSchema = z.object({
   KAFKA_CLICKS_TOPIC: z.string().default('url-clicks'),
   KAFKA_CLICKS_PARTITIONS: z.coerce.number().int().min(1).default(3),
   KAFKA_CONSUMER_GROUP: z.string().default('analytics-worker'),
+  // Small HTTP server in the analytics worker, for Docker health checks (and metrics in Phase 10).
+  WORKER_HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(9101),
 
   // Number of reverse proxies (e.g. Nginx) in front of the app. Express then
   // trusts that many X-Forwarded-For hops when working out req.ip.
@@ -120,5 +129,6 @@ export const config = Object.freeze({
     clicksPartitions: env.KAFKA_CLICKS_PARTITIONS,
     consumerGroup: env.KAFKA_CONSUMER_GROUP,
   },
+  workerHealthPort: env.WORKER_HEALTH_PORT,
   trustProxy: env.TRUST_PROXY,
 });

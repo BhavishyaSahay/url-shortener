@@ -4,7 +4,8 @@ A URL shortener in the style of a simplified Bitly: users create short links tha
 URLs, and see analytics about who clicked them.
 
 Details live in [LLD.md](LLD.md) (algorithms and trade-offs), [DATABASE.md](DATABASE.md) (schema
-and indexes), [API.md](API.md) (endpoints) and DEVOPS.md (Phase 7+).
+and indexes), [API.md](API.md) (endpoints) and [DEVOPS.md](DEVOPS.md) (containers, Nginx,
+deployment).
 
 ## 1. Problem statement
 
@@ -51,7 +52,7 @@ Out of scope: custom domains, link previews, teams and roles, billing, a fronten
                                  │ HTTP
                                  ▼
                           ┌──────────────┐
-                          │    Nginx     │  reverse proxy, load balancing (Phase 7)
+                          │    Nginx     │  reverse proxy, load balancing
                           └──────┬───────┘
                     ┌────────────┴────────────┐
                     ▼                         ▼
@@ -82,7 +83,7 @@ consumption), a different scaling profile, and must not affect redirects if it f
 
 | Component | Responsibility | State? |
 | --------- | -------------- | ------ |
-| **Nginx** (Phase 7) | Single entry point, reverse proxy to API instances, forwards client IP headers, request limits | No |
+| **Nginx** | Single entry point, reverse proxy + round-robin load balancing across API instances (re-resolved via Docker DNS), forwards client IP headers, request limits | No |
 | **Express API** | Auth, URL CRUD, redirects, rate limiting, analytics queries, publishing click events | **No**: sessions are JWTs, counters live in Redis |
 | **PostgreSQL** | Users, URLs, click events, daily rollups. **Source of truth** | Yes |
 | **Redis** | Cache `shortCode → URL`, rate-limit counters. Losing it loses nothing permanent | Ephemeral |
@@ -178,7 +179,7 @@ scale.
 
 | Layer | How it scales | Limit / next step |
 | ----- | ------------- | ----------------- |
-| API | Run N identical instances behind Nginx (Phase 7). No sticky sessions: JWTs, Redis counters and DB sequences are shared | CPU per instance; the DB connection budget (N × pool size) |
+| API | Run N identical instances behind Nginx (`docker compose up --scale api=N`; verified with 3, even 10/10/10 split). No sticky sessions: JWTs, Redis counters and DB sequences are shared | CPU per instance; the DB connection budget (N × pool size) |
 | Redirect reads | Mostly served by Redis. PostgreSQL only sees misses | Redis memory → LRU; later Redis replicas or cluster |
 | URL writes | One `nextval()` + one `INSERT`. The sequence is safe across instances | A single primary DB; fine for this scale |
 | Analytics ingest | Add worker instances to the same consumer group, up to the number of partitions (3) | Add partitions; batch size |

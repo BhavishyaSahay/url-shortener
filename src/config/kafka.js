@@ -58,11 +58,18 @@ export async function ensureClickTopic({ maxAttempts = 15 } = {}) {
   for (let attempt = 1; ; attempt++) {
     try {
       await admin.connect();
-      const created = await admin.createTopics({
+      // Check first: asking Kafka to create an existing topic "works" but makes
+      // kafkajs log a scary error-level line on every worker start.
+      const existing = await admin.listTopics();
+      if (existing.includes(config.kafka.clicksTopic)) {
+        logger.info({ topic: config.kafka.clicksTopic }, 'Kafka topic already exists');
+        return;
+      }
+      await admin.createTopics({
         waitForLeaders: true,
         topics: [{ topic: config.kafka.clicksTopic, numPartitions: config.kafka.clicksPartitions, replicationFactor: 1 }],
       });
-      logger.info({ topic: config.kafka.clicksTopic, created }, created ? 'Kafka topic created' : 'Kafka topic already exists');
+      logger.info({ topic: config.kafka.clicksTopic, partitions: config.kafka.clicksPartitions }, 'Kafka topic created');
       return;
     } catch (err) {
       if (attempt >= maxAttempts) throw new Error(`Kafka not reachable after ${attempt} attempts: ${err.message}`, { cause: err });

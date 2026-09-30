@@ -18,7 +18,7 @@ The project is built in phases, and each one is verified before the next starts.
 | 4 | URL shortening: Base62, custom aliases, expiry, CRUD with ownership checks | ✅ Done |
 | 5 | Redirects, Redis cache-aside, negative caching, fixed-window rate limiting | ✅ Done |
 | 6 | Kafka click events, analytics worker (idempotent, batched), analytics API | ✅ Done |
-| 7 | Docker, Docker Compose, Nginx | ⏳ |
+| 7 | Docker (multi-stage, non-root), Compose (dev + prod), Nginx load balancing | ✅ Done |
 | 8 | CI/CD with GitHub Actions | ⏳ |
 | 9 | AWS EC2 deployment | ⏳ |
 | 10 | Prometheus + Grafana monitoring | ⏳ |
@@ -26,27 +26,42 @@ The project is built in phases, and each one is verified before the next starts.
 
 ## Running locally
 
-Requirements: Node.js 20.12+ and Docker.
+### Option A: everything in Docker (recommended)
+
+Requirements: Docker Desktop.
 
 ```bash
 cp .env.example .env
 # set JWT_SECRET in .env (required, 32+ chars):
 node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"
-npm install          # also generates the Prisma client (postinstall)
-npm run db:up        # start PostgreSQL, Redis and Kafka in Docker, wait until healthy
-npm run db:migrate   # apply database migrations
-npm run dev          # terminal 1: the API, with auto-reload
-npm run worker:dev   # terminal 2: the analytics worker (Kafka → PostgreSQL)
+docker compose up -d --build --wait
 ```
+
+Open **http://localhost:8080** (Nginx → 2 API instances). That starts PostgreSQL, Redis, Kafka,
+the migrations, 2 API replicas, the analytics worker and Nginx.
 
 ```bash
-curl http://localhost:3000/health   # liveness: is the process up?
-curl http://localhost:3000/ready    # readiness: PostgreSQL (critical), Redis and Kafka (optional)
+curl http://localhost:8080/health   # liveness: is the process up?
+curl http://localhost:8080/ready    # readiness: PostgreSQL (critical), Redis and Kafka (optional)
+docker compose ps                   # health of every container
+docker compose down                 # stop (data is kept; add -v to delete it)
 ```
 
-Containers are published on non-default host ports to avoid clashing with locally installed
-services: **PostgreSQL on 5433**, **Redis on 6380**, and Kafka on its usual **9092**. Change `POSTGRES_PORT`/`DATABASE_URL`
-and `REDIS_PORT`/`REDIS_URL` in `.env` if needed.
+### Option B: app on the host, infrastructure in Docker (fast edit-reload)
+
+Requirements: Node.js 20.12+ and Docker.
+
+```bash
+cp .env.example .env                                # and set JWT_SECRET as above
+npm install                                         # also generates the Prisma client
+docker compose up -d --wait postgres redis kafka    # just the infrastructure
+npm run db:migrate                                  # apply database migrations
+npm run dev                                         # terminal 1: API on http://localhost:3000
+npm run worker:dev                                  # terminal 2: analytics worker
+```
+
+Infrastructure ports on the host avoid clashing with locally installed services:
+**PostgreSQL 5433**, **Redis 6380**, **Kafka 9092**, **Nginx 8080**. Change them in `.env` if needed.
 
 ## Scripts
 
@@ -63,6 +78,9 @@ and `REDIS_PORT`/`REDIS_URL` in `.env` if needed.
 | `npm run db:migrate` | Create/apply migrations in development |
 | `npm run db:deploy` | Apply pending migrations (CI/production) |
 | `npm run db:studio` | Browse the database in Prisma Studio |
+| `npm run docker:up` | Build and start the whole stack in Docker, wait until healthy |
+| `npm run docker:down` | Stop the Docker stack (data kept) |
+| `npm run docker:logs` | Follow API, worker and Nginx logs |
 
 ## Project structure
 
@@ -78,6 +96,8 @@ src/
   server.js     starts the HTTP server and handles graceful shutdown
 prisma/         schema.prisma + SQL migrations
 worker/         analytics worker: Kafka consumer → PostgreSQL (separate process)
+docker/         multi-stage Dockerfiles (api, worker)
+nginx/          reverse proxy / load balancer config
 tests/          unit/, integration/, load/ (k6)
 docs/           HLD, LLD, API, DATABASE, DEVOPS
 ```
@@ -88,3 +108,4 @@ docs/           HLD, LLD, API, DATABASE, DEVOPS
 - [docs/API.md](docs/API.md): endpoints with curl examples
 - [docs/LLD.md](docs/LLD.md): low-level design (Kafka, caching, rate limiting, Base62, concurrency, auth)
 - [docs/DATABASE.md](docs/DATABASE.md): schema, indexes, constraints, pooling
+- [docs/DEVOPS.md](docs/DEVOPS.md): Docker images, Compose, networking, Nginx, health checks, secrets

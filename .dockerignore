@@ -1,0 +1,31 @@
+# Everything listed here is kept OUT of the Docker build context.
+# Smaller context = faster builds, and secrets can never be baked into an image.
+
+# Dependencies are installed inside the image (for Linux, not macOS)
+node_modules
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+secrets
+*.pem
+*.key
+
+# Not needed at runtime
+.git
+.github
+tests
+docs
+coverage
+logs
+*.log
+infrastructure
+nginx
+docker-compose*.yml
+docker
+.dockerignore
+.vscode
+.idea
+.DS_Store
+README.md
