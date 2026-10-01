@@ -64,14 +64,14 @@ curl http://localhost:3000/health
 
 ### `GET /ready`: readiness
 
-Can this instance serve traffic? PostgreSQL is **critical**. Redis and Kafka are
-**non-critical**: without Redis the API is slower and unrate-limited, and without Kafka clicks
-aren't recorded, but everything else works.
+Can this instance serve traffic? PostgreSQL is **critical**. Redis is **non-critical**: without
+it the API is slower (no cache), unrate-limited, and clicks aren't recorded, but redirects and
+everything else still work.
 
 | Status | Body |
 | ------ | ---- |
-| 200 | `{ "status": "ready", "checks": { "database": "up", "redis": "up", "kafka": "up" } }` |
-| 200 | `{ "status": "degraded", "checks": { "database": "up", "redis": "down", "kafka": "up" } }` |
+| 200 | `{ "status": "ready", "checks": { "database": "up", "redis": "up" } }` |
+| 200 | `{ "status": "degraded", "checks": { "database": "up", "redis": "down" } }` |
 | 503 | `{ "status": "not_ready", "checks": { "database": "down", … } }` |
 | 503 | `{ "status": "shutting_down" }` during graceful shutdown |
 
@@ -372,9 +372,9 @@ curl -b cookies.txt 'http://localhost:3000/api/v1/urls/6/analytics?days=3'
 
 Notes:
 
-- **Eventually consistent:** clicks are processed asynchronously (API → Kafka → worker), so a
+- **Eventually consistent:** clicks are processed asynchronously (API → Redis Stream → worker), so a
   click appears here shortly after the redirect, not instantly.
-- `HEAD` requests aren't counted. Clicks while Kafka is unavailable aren't recorded (redirects
+- `HEAD` requests aren't counted. Clicks while Redis is unavailable aren't recorded (redirects
   still work).
 
 Errors: `400` invalid `days` or ID · `401` · `404` not found or not yours.

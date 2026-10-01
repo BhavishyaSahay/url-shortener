@@ -31,7 +31,7 @@ export function fillDailySeries(rows, from, days) {
  *
  * Totals are all-time; the breakdowns cover the last `days` days (UTC).
  * Data is EVENTUALLY consistent: a click shows up here once the worker has
- * processed it from Kafka (normally well under a second).
+ * processed it from the Redis Stream (normally well under a second).
  */
 export async function getUrlAnalytics({ userId, id, days, now = new Date() }) {
   const url = await getUrl({ userId, id });

@@ -63,15 +63,11 @@ export const envSchema = z.object({
   RATE_LIMIT_CREATE_URL_MAX: z.coerce.number().int().positive().default(30),
   RATE_LIMIT_CREATE_URL_WINDOW: duration.prefault('1m'),
 
-  // Kafka (click events)
-  KAFKA_BROKERS: z
-    .string()
-    .default('localhost:9092')
-    .transform((value) => value.split(',').map((b) => b.trim()).filter(Boolean)),
-  KAFKA_CLIENT_ID: z.string().default('url-shortener'),
-  KAFKA_CLICKS_TOPIC: z.string().default('url-clicks'),
-  KAFKA_CLICKS_PARTITIONS: z.coerce.number().int().min(1).default(3),
-  KAFKA_CONSUMER_GROUP: z.string().default('analytics-worker'),
+  // Click events: a Redis Stream (the queue between the API and the analytics worker)
+  CLICKS_STREAM: z.string().min(1).default('url-clicks'),
+  CLICKS_CONSUMER_GROUP: z.string().min(1).default('analytics-worker'),
+  // Approximate cap on stream length, so a stopped worker can't fill Redis's memory.
+  CLICKS_STREAM_MAXLEN: z.coerce.number().int().min(1000).default(100_000),
   // Small HTTP server in the analytics worker, for Docker health checks (and metrics in Phase 10).
   WORKER_HEALTH_PORT: z.coerce.number().int().min(1).max(65535).default(9101),
 
@@ -122,12 +118,10 @@ export const config = Object.freeze({
     login: { max: env.RATE_LIMIT_LOGIN_MAX, windowSeconds: env.RATE_LIMIT_LOGIN_WINDOW },
     createUrl: { max: env.RATE_LIMIT_CREATE_URL_MAX, windowSeconds: env.RATE_LIMIT_CREATE_URL_WINDOW },
   },
-  kafka: {
-    brokers: env.KAFKA_BROKERS,
-    clientId: env.KAFKA_CLIENT_ID,
-    clicksTopic: env.KAFKA_CLICKS_TOPIC,
-    clicksPartitions: env.KAFKA_CLICKS_PARTITIONS,
-    consumerGroup: env.KAFKA_CONSUMER_GROUP,
+  clicks: {
+    stream: env.CLICKS_STREAM,
+    consumerGroup: env.CLICKS_CONSUMER_GROUP,
+    maxLength: env.CLICKS_STREAM_MAXLEN,
   },
   workerHealthPort: env.WORKER_HEALTH_PORT,
   trustProxy: env.TRUST_PROXY,

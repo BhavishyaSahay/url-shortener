@@ -29,9 +29,9 @@ describe('environment config', () => {
     expect(() => envSchema.parse({ DATABASE_URL: 'mysql://u:p@db/app' })).toThrow();
   });
 
-  it('splits KAFKA_BROKERS into a list and parses booleans properly', () => {
-    const env = envSchema.parse({ ...minimalEnv, KAFKA_BROKERS: 'k1:9092, k2:9092', COOKIE_SECURE: 'false' });
-    expect(env.KAFKA_BROKERS).toEqual(['k1:9092', 'k2:9092']);
+  it('parses numbers and booleans properly', () => {
+    const env = envSchema.parse({ ...minimalEnv, CLICKS_STREAM_MAXLEN: '50000', COOKIE_SECURE: 'false' });
+    expect(env.CLICKS_STREAM_MAXLEN).toBe(50_000);
     expect(env.COOKIE_SECURE).toBe(false); // z.coerce.boolean('false') would have been true
   });
 });

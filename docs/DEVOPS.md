@@ -32,8 +32,8 @@ monitoring (Phase 10) are added as they're built.
 │         └─────────► api (replica 2)              │
 └──────────────────────────┬───────────────────────┘
 ┌──────────────────────────▼──── backend network ──────────────────────────┐
-│   api ──► postgres:5432     api ──► redis:6379     api ──► kafka:19092   │
-│   worker ──► kafka:19092    worker ──► postgres:5432                     │
+│   api ──► postgres:5432     api ──► redis:6379 (cache, limits, XADD)     │
+│   worker ──► redis:6379 (XREADGROUP)    worker ──► postgres:5432         │
 │   migrate ──► postgres:5432   (runs once, exits 0)                       │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -42,11 +42,10 @@ monitoring (Phase 10) are added as they're built.
 | --------- | ----- | ---- | --------------- |
 | nginx | `nginx:1.28-alpine` | Reverse proxy, load balancer, only entry point | **8080** |
 | api ×2 | `url-shortener-api` (ours) | Express API | none |
-| worker | `url-shortener-worker` (ours) | Kafka consumer → PostgreSQL | none |
+| worker | `url-shortener-worker` (ours) | Redis Stream consumer → PostgreSQL | none |
 | migrate | `url-shortener-migrate` (ours) | `prisma migrate deploy`, then exits | none |
 | postgres | `postgres:17-alpine` | Database | 127.0.0.1:5433 (dev tools only) |
-| redis | `redis:7.4-alpine` | Cache, rate limits | 127.0.0.1:6380 (dev tools only) |
-| kafka | `apache/kafka:4.1.0` | Event log (KRaft, no ZooKeeper) | 127.0.0.1:9092 (dev tools only) |
+| redis | `redis:7.4-alpine` | Cache, rate limits, click-event stream (AOF-persisted) | 127.0.0.1:6380 (dev tools only) |
 
 **Why containers?** The same image runs on a laptop, in CI and on EC2, with the same Node version,
 OS libraries and native modules (argon2), so "works on my machine" problems go away. Starting the
@@ -121,12 +120,12 @@ Two development workflows:
 1. **Everything in Docker** (above): closest to production. Code changes need
    `docker compose up -d --build api`.
 2. **Infrastructure in Docker, app on the host** for fast edit-reload:
-   `docker compose up -d --wait postgres redis kafka`, then `npm run dev` and `npm run worker:dev`.
-   The host-mapped ports (5433, 6380, 9092) exist for this, and for the integration tests.
+   `docker compose up -d --wait postgres redis`, then `npm run dev` and `npm run worker:dev`.
+   The host-mapped ports (5433, 6380) exist for this, and for the integration tests.
 
-**Volumes:** `postgres-data` and `kafka-data` are *named volumes*. Data lives outside the
-container, so recreating containers (new image, changed config) keeps it. Redis deliberately has
-no volume: it's a cache.
+**Volumes:** `postgres-data` and `redis-data` are *named volumes*. Data lives outside the
+container, so recreating containers (new image, changed config) keeps it. Redis needs one because
+it holds the click-event queue: its append-only file (AOF) lives there.
 
 **YAML anchors** (`x-logging: &default-logging`, `<<: *app-env`) avoid repeating the same
 settings in every service.
@@ -138,10 +137,10 @@ Compose creates two user-defined bridge networks:
 | Network | Members | Purpose |
 | ------- | ------- | ------- |
 | `frontend` | nginx, api | Only what faces clients |
-| `backend` | api, worker, migrate, postgres, redis, kafka | Data stores. Nginx is not on it |
+| `backend` | api, worker, migrate, postgres, redis | Data stores. Nginx is not on it |
 
 - **Service discovery by name.** Docker runs an embedded DNS server (127.0.0.11) on every
-  user-defined network. `postgres`, `redis`, `kafka` and `api` resolve to the containers' current
+  user-defined network. `postgres`, `redis` and `api` resolve to the containers' current
   IPs. Scaling `api` to 2 replicas makes `api` resolve to 2 IPs.
 - **Why never hardcode container IPs:** they're assigned when a container is created and change
   whenever it's recreated (new image, restart after a crash, scaling). A name is stable.
@@ -151,14 +150,8 @@ Compose creates two user-defined bridge networks:
 - **Segmentation (verified):** nginx can't even *resolve* `postgres` (`nc: bad address
   'postgres'`), and the API isn't reachable from the host (`localhost:3000` gives no connection).
   All traffic goes through nginx.
-- **Kafka's two listeners.** A Kafka client first connects to any broker address, then receives the
-  broker's *advertised* address and reconnects to that, so the advertised address must be
-  reachable from the client's side:
-  - `INTERNAL kafka:19092` for containers on the backend network
-  - `EXTERNAL localhost:9092` for processes on the host (dev and tests)
-  - Production only needs `INTERNAL`.
-- **Trade-off:** the backend network is flat. The worker could technically reach Redis, which it
-  doesn't need. Finer segmentation (a network per dependency) is possible but adds complexity
+- **Trade-off:** the backend network is flat, so every backend container can reach every other
+  one. Finer segmentation (a network per dependency) is possible but adds complexity
   without much gain on a single host.
 
 ## 5. Nginx
@@ -200,7 +193,6 @@ container IP, and a request with `X-Forwarded-For: 1.2.3.4` was still limited.
 | ------- | ------------ | ------- |
 | postgres | `pg_isready` | Accepting connections |
 | redis | `redis-cli ping` | Answers commands |
-| kafka | `kafka-broker-api-versions.sh` | Broker answers API requests |
 | api | `wget /health` (Dockerfile `HEALTHCHECK`) | Node process serving HTTP (liveness, not dependencies) |
 | worker | `wget :9101/health` | Worker process alive |
 | nginx | `wget /nginx-health` | Nginx serving |
@@ -211,15 +203,15 @@ and hope":
 ```text
 postgres (healthy) ──► migrate (completed successfully) ──► api (healthy) ──► nginx
                                                         └──► worker
-kafka (healthy) ─────────────────────────────────────────────┘ (worker only)
+redis (healthy) ─────────────────────────────────────────────┘ (worker only)
 ```
 
 - `service_healthy` waits for the health check, not just the process start. A Postgres container
   is "running" several seconds before it accepts connections.
 - `service_completed_successfully` means the API and worker never run against an unmigrated
   schema. If a migration fails, they don't start at all.
-- The API only needs Redis and Kafka **started** (it degrades without them). The worker needs
-  Kafka **healthy**.
+- The API only needs Redis **started** (it degrades without it). The worker needs Redis
+  **healthy**, because the stream is its whole job.
 - Defense in depth: the API *also* retries its DB connection at startup (Phase 2), so
   orchestrators without `depends_on` (ECS, Kubernetes) behave correctly too.
 
@@ -232,7 +224,7 @@ replicas, both would otherwise try to migrate at the same moment.
 docker stop / compose down / new deploy
    │ SIGTERM ──► tini (init: true, PID 1) ──► node
    │              node: /ready → 503, server.close(), wait for in-flight requests,
-   │                    close Postgres, Redis, Kafka, exit 0
+   │                    close Postgres and Redis, exit 0
    │ ... up to stop_grace_period (15 s) ...
    └ SIGKILL if still running
 ```
@@ -261,8 +253,8 @@ analytics working on port 80.
 | Secrets | local defaults | `${VAR:?}`: compose **refuses to start** if `JWT_SECRET`, `POSTGRES_PASSWORD`, `APP_BASE_URL` or `IMAGE_PREFIX` is missing |
 | Data store ports | 127.0.0.1-mapped for tools | **None** published. Only nginx `:80` (and `:443` later) |
 | Backend network | normal | `internal: true`: no internet egress (verified: worker → example.com is blocked) |
-| Kafka listeners | internal + external | internal only; retention 7 days / 1 GB per partition |
-| Resource limits | none | per-container memory/CPU limits (below) |
+| Resource limits | none | per-container memory/CPU limits sized for a **1 GB t3.micro** (below) |
+| Postgres / Redis tuning | defaults | `shared_buffers=64MB`, `max_connections=50`; Redis `maxmemory 64mb` |
 | Logs | rotate 3 × 10 MB | rotate 5 × 10 MB |
 | API cookies | `COOKIE_SECURE=false` | `true` by default (set false until HTTPS exists) |
 
@@ -270,16 +262,18 @@ analytics working on port 80.
 
 | Container | Limit | Idle usage |
 | --------- | ----- | ---------- |
-| kafka | 1 GB | 436 MiB |
-| postgres | 768 MB | 65 MiB |
-| api × 2 | 384 MB each | 60 MiB each |
-| worker | 256 MB | 54 MiB |
-| redis | 192 MB | 10 MiB |
-| nginx | 64 MB | 9 MiB |
-| **Total** | **~3.0 GB** | **~695 MiB** |
+| postgres | 256 MB | 65 MiB |
+| api × 2 | 192 MB each | 60 MiB each |
+| worker | 160 MB | 57 MiB |
+| redis | 128 MB | 10 MiB |
+| nginx | 32 MB | 9 MiB |
+| **Total** | **~960 MB** | **~260 MiB** |
 
-Idle numbers aren't load numbers. They show the baseline (Kafka's JVM dominates) and suggest a
-4 GB instance for comfortable headroom. Real usage under load gets measured in Phase 11.
+With the OS (~150–250 MB) and the Docker daemon (~60 MB), a t3.micro sits around 500 MB of its
+1 GB at idle, plus swap as a safety net. The first version of this stack ran Apache Kafka, whose
+JVM alone used 436 MiB (the total was ~695 MiB), which wouldn't fit. That's why click events now
+go through a Redis Stream (see [LLD.md](LLD.md)). Idle numbers aren't load numbers; usage under
+load gets measured in Phase 11.
 
 ```bash
 # on the server, next to a .env created from .env.production.example (chmod 600)
@@ -306,12 +300,12 @@ clear message.
 | `JWT_SECRET` | **required by the API** | api | **Secret.** ≥ 32 chars. The worker doesn't get it |
 | `JWT_EXPIRES_IN` | 1d | api | `3600`, `30s`, `15m`, `12h`, `7d` |
 | `COOKIE_SECURE` | true in production | api | Needs HTTPS |
-| `REDIS_URL` | redis://localhost:6380/0 | api | |
+| `REDIS_URL` | redis://localhost:6380/0 | api, worker | |
 | `URL_CACHE_TTL` / `URL_NEGATIVE_CACHE_TTL` | 1h / 60s | api | |
 | `RATE_LIMIT_*` | 10 per 15m (login), 30 per 1m (create) | api | |
 | `TRUST_PROXY` | 0 | api | 1 behind nginx |
-| `KAFKA_BROKERS` | localhost:9092 | api, worker | `kafka:19092` in containers |
-| `KAFKA_CLICKS_TOPIC`, `KAFKA_CONSUMER_GROUP`, `KAFKA_CLICKS_PARTITIONS` | url-clicks, analytics-worker, 3 | api, worker | |
+| `CLICKS_STREAM`, `CLICKS_CONSUMER_GROUP` | url-clicks, analytics-worker | api, worker | The Redis Stream and consumer group |
+| `CLICKS_STREAM_MAXLEN` | 100000 | api | Approximate cap while the worker is behind |
 | `WORKER_HEALTH_PORT` | 9101 | worker | |
 
 **Secrets:**
@@ -321,8 +315,7 @@ clear message.
 - Never baked into images. `.dockerignore` excludes `.env`, and the Dockerfiles contain no secrets.
   The build-time `DATABASE_URL` is a placeholder only.
 - Never logged. pino redacts cookies, authorization headers and password fields.
-- **Least privilege:** each container receives only what it needs. The worker has no JWT secret
-  and no Redis URL.
+- **Least privilege:** each container receives only what it needs. The worker has no JWT secret.
 - In production (Phase 9): a `.env` file on the server with `chmod 600`, or AWS SSM Parameter
   Store. In CI/CD (Phase 8): GitHub Actions secrets.
 
@@ -366,7 +359,7 @@ setup and the test suite had hidden:
 | `api` stuck "starting" | `docker compose logs migrate` (a failed migration blocks the API), `docker compose ps` |
 | 502 from nginx | No healthy API instance: `docker compose ps api`, `docker compose logs api` |
 | `JWT_SECRET must be set` on `up` | Create `.env` from `.env.example` |
-| Port already allocated | Something on the host uses 8080/5433/6380/9092: change `NGINX_PORT`, `POSTGRES_PORT`, `REDIS_PORT` or `KAFKA_PORT` in `.env` |
+| Port already allocated | Something on the host uses 8080/5433/6380: change `NGINX_PORT`, `POSTGRES_PORT` or `REDIS_PORT` in `.env` |
 | Inside a container | `docker compose exec api sh` (Alpine: `wget`, `nc` available) |
 
 ## 13. CI pipeline
@@ -377,21 +370,21 @@ push to `main`**. Three jobs run in parallel, and all three must pass:
 | Job | Steps | Time budget |
 | --- | ----- | ----------- |
 | **Lint, audit & unit tests** | `npm ci`, ESLint, `npm audit` (production deps, fails on high/critical), unit tests | 10 min |
-| **Integration tests** | Real **PostgreSQL, Redis and Kafka** as service containers; `prisma migrate deploy`; integration tests; **schema drift check** | 15 min |
+| **Integration tests** | Real **PostgreSQL and Redis** as service containers; `prisma migrate deploy`; integration tests; **schema drift check** | 15 min |
 | **Docker build & smoke test** | Build the api/worker/migrate images exactly as production; start the full Compose stack; run `scripts/smoke-test.sh` through Nginx | 20 min |
 
 Details worth knowing:
 
 - **`npm ci`, not `npm install`**, installs exactly the lockfile and fails if `package.json` and
   `package-lock.json` disagree.
-- **Service containers** use the same host ports as local development (5433, 6380, 9092), so the
+- **Service containers** use the same host ports as local development (5433, 6380), so the
   test configuration is identical on a laptop and in CI.
 - **Schema drift check:** after the migrations run, `prisma migrate diff --exit-code` compares the
   database with `schema.prisma`. Tested locally: exit 0 when in sync, **exit 2** when a column was
   added to the schema without a migration, which fails CI before the missing migration can reach
   production.
 - **Why a Docker smoke test in CI:** unit and integration tests run the *code*; the smoke test runs
-  the *images*: config defaults, native modules, networking, migrations, Kafka → worker. The
+  the *images*: config defaults, native modules, networking, migrations, Redis Stream → worker. The
   Phase 7 Zod-default bug passed 274 tests and would only have been caught here.
 - **Audit gate:** `npm audit --omit=dev --omit=optional --audit-level=high` checks what actually
   ships in the image (0 vulnerabilities at the time of writing). Advisories in dev-only tooling
@@ -406,7 +399,7 @@ Run the same checks locally:
 ```bash
 npm ci && npm run lint && npm audit --omit=dev --omit=optional --audit-level=high
 npm run test:unit
-docker compose up -d --wait postgres redis kafka && npm run test:integration
+docker compose up -d --wait postgres redis && npm run test:integration
 docker compose up -d --build --wait && scripts/smoke-test.sh http://localhost:8080
 ```
 

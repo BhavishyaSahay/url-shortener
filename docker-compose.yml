@@ -5,18 +5,18 @@
 #   docker compose logs -f api worker      follow logs
 #   docker compose up -d --build api       rebuild + restart just the API after a code change
 #   docker compose down                    stop and remove containers (data volumes are kept)
-#   docker compose down -v                 ...and DELETE all data (Postgres, Kafka)
+#   docker compose down -v                 ...and DELETE all data (Postgres, Redis)
 #
 # Open http://localhost:8080 (through Nginx).
 #
 # Networks: two, so each service can only reach what it needs.
 #
 #   frontend:  nginx ── api
-#   backend:   api ── worker ── migrate ── postgres ── redis ── kafka
+#   backend:   api ── worker ── migrate ── postgres ── redis
 #
 # Nginx isn't on the backend network, so it can't reach PostgreSQL even if
 # compromised. Services find each other by SERVICE NAME (postgres, redis,
-# kafka, api) through Docker's built-in DNS. No IP addresses are hardcoded
+# api) through Docker's built-in DNS. No IP addresses are hardcoded
 # anywhere: container IPs change every time a container is recreated.
 #
 # Secrets: only JWT_SECRET (and optionally POSTGRES_*) are read from .env,
@@ -36,8 +36,8 @@ x-app-env: &app-env
   LOG_LEVEL: info
   # Containers reach each other by service name and CONTAINER port (5432, not the 5433 host port).
   DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-url_shortener}
-  KAFKA_BROKERS: kafka:19092        # the INTERNAL listener, see the kafka service
-  KAFKA_CLICKS_TOPIC: url-clicks
+  REDIS_URL: redis://redis:6379/0
+  CLICKS_STREAM: url-clicks         # Redis Stream carrying click events from the API to the worker
   SHUTDOWN_TIMEOUT_MS: 10000
 
 services:
@@ -68,53 +68,25 @@ services:
 
   redis:
     image: redis:7.4-alpine
-    # Cache + rate-limit counters only: no persistence, and LRU eviction when full.
-    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    # Redis has three jobs: URL cache, rate-limit counters, and the click-event
+    # STREAM (the queue to the analytics worker). The stream changes two settings:
+    #   --appendonly yes          persist writes to disk (fsync every second), so
+    #                             queued clicks survive a Redis restart
+    #   volatile-lru              when memory is full, evict only keys WITH a TTL
+    #                             (cache entries, rate-limit counters). The stream
+    #                             has no TTL, so it's never evicted. (allkeys-lru
+    #                             could silently evict the whole queue.)
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "", "--maxmemory", "128mb", "--maxmemory-policy", "volatile-lru"]
     ports:
       - "127.0.0.1:${REDIS_PORT:-6380}:6379"   # 6380 avoids a local Redis on 6379
+    volumes:
+      - redis-data:/data                       # the append-only file lives here
     networks: [backend]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 10
-    restart: unless-stopped
-    logging: *default-logging
-
-  kafka:
-    image: apache/kafka:4.1.0
-    # Single-node Kafka in KRaft mode (broker + controller in one process, no ZooKeeper).
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      # Clients connect, then Kafka tells them which address to use ("advertised"),
-      # and that address must be reachable from the CLIENT's side:
-      #   INTERNAL kafka:19092     containers on the backend network (api, worker)
-      #   EXTERNAL localhost:9092  processes on your Mac (npm run dev, tests)
-      KAFKA_LISTENERS: INTERNAL://:19092,EXTERNAL://:9092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://localhost:${KAFKA_PORT:-9092}
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1       # one broker → one copy of internal topics
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"        # topics are created deliberately (by the worker)
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_HEAP_OPTS: -Xmx512m -Xms512m              # JVM heap; the 1 GB default is more than dev needs
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-    ports:
-      - "127.0.0.1:${KAFKA_PORT:-9092}:9092"
-    volumes:
-      - kafka-data:/var/lib/kafka/data
-    networks: [backend]
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
-      interval: 10s
-      timeout: 10s
-      retries: 12
-      start_period: 15s
     restart: unless-stopped
     logging: *default-logging
 
@@ -160,7 +132,6 @@ services:
       APP_BASE_URL: http://localhost:${NGINX_PORT:-8080}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env (see .env.example)}
       COOKIE_SECURE: "false"          # plain HTTP locally; true once HTTPS exists (Phase 9)
-      REDIS_URL: redis://redis:6379/0
       TRUST_PROXY: 1                  # exactly one proxy (nginx) in front
       DB_POOL_MAX: 10
     # No `ports:`. The API is only reachable through nginx, on the Docker network.
@@ -170,11 +141,9 @@ services:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
-      # Redis and Kafka are optional for the API (it degrades without them), so
-      # it only needs them to have started, not to be healthy.
+      # Redis is optional for the API (it degrades without it), so it only
+      # needs to have started, not to be healthy.
       redis:
-        condition: service_started
-      kafka:
         condition: service_started
     init: true                        # tiny init process as PID 1: forwards signals, reaps zombies
     stop_grace_period: 15s            # SIGTERM → up to 15 s for graceful shutdown → SIGKILL
@@ -190,21 +159,21 @@ services:
     environment:
       <<: *app-env
       SERVICE_NAME: analytics-worker
-      KAFKA_CONSUMER_GROUP: analytics-worker
+      CLICKS_CONSUMER_GROUP: analytics-worker
       DB_POOL_MAX: 5                  # batched writes need few connections
-      # Note: no JWT_SECRET and no REDIS_URL. The worker doesn't need them (least privilege).
+      # Note: no JWT_SECRET. The worker never signs tokens (least privilege).
     networks: [backend]
     depends_on:
       migrate:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
-      kafka:
-        condition: service_healthy    # unlike the API, the worker can't do anything without Kafka
+      redis:
+        condition: service_healthy    # unlike the API, the worker can't do anything without the stream
     init: true
     stop_grace_period: 15s
-    # "Let it crash": if the Kafka consumer gives up, the process exits, and
-    # this policy starts a fresh one, which resumes from the last committed offset.
+    # If the process dies, Docker starts a new one. Entries it hadn't
+    # acknowledged are still pending in the stream and get processed (or claimed).
     restart: unless-stopped
     logging: *default-logging
 
@@ -232,4 +201,4 @@ networks:
 
 volumes:
   postgres-data:
-  kafka-data:
+  redis-data:

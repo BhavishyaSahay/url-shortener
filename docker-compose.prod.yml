@@ -1,13 +1,14 @@
-# Production stack, meant for a single server (AWS EC2, Phase 9).
+# Production stack for a single small server: AWS EC2 t3.micro (1 GB RAM, 2 vCPU).
 #
 # Differences from docker-compose.yml (development):
-#   - images are PULLED from a registry by tag (built and pushed by CI/CD, Phase 8),
+#   - images are PULLED from a registry by tag (built and pushed by CI/CD),
 #     never built on the server
 #   - every secret is REQUIRED from the environment: compose refuses to start
 #     if one is missing (${VAR:?message}), and no secret is written in this file
-#   - no database/cache/broker ports on the host; only nginx is reachable
+#   - no database/cache ports on the host; only nginx is reachable
 #   - the backend network is `internal`: those containers can't reach the internet
-#   - memory/CPU limits sized for one small instance, restart policies, log rotation
+#   - memory limits sized for 1 GB of RAM (plus swap on the host), restart
+#     policies, log rotation
 #
 # Usage on the server (with a .env file next to this one, chmod 600):
 #   docker compose -f docker-compose.prod.yml pull
@@ -30,13 +31,17 @@ x-app-env: &app-env
   NODE_ENV: production
   LOG_LEVEL: ${LOG_LEVEL:-info}
   DATABASE_URL: postgresql://${POSTGRES_USER:-urlshortener}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:-url_shortener}
-  KAFKA_BROKERS: kafka:19092
-  KAFKA_CLICKS_TOPIC: url-clicks
+  REDIS_URL: redis://redis:6379/0
+  CLICKS_STREAM: url-clicks
   SHUTDOWN_TIMEOUT_MS: 10000
 
 services:
   postgres:
     image: postgres:17-alpine
+    # Sized for a 1 GB server: Postgres's own page cache (shared_buffers) is
+    # 128 MB by default; 64 MB is plenty for this data set. 50 connections
+    # covers 2 API instances × 10 + the worker's 3, with room for psql.
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=50"]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-urlshortener}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
@@ -51,13 +56,18 @@ services:
       retries: 10
     deploy:
       resources:
-        limits: { memory: 768m, cpus: "1.0" }
+        limits: { memory: 256m, cpus: "1.0" }
     restart: unless-stopped
     logging: *default-logging
 
   redis:
     image: redis:7.4-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    # Cache + rate limits + the click-event stream (see docker-compose.yml for
+    # why AOF persistence and volatile-lru eviction). 64 MB of data is plenty
+    # here: cache entries are tiny, and processed stream entries are deleted.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "", "--maxmemory", "64mb", "--maxmemory-policy", "volatile-lru"]
+    volumes:
+      - redis-data:/data
     networks: [backend]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -66,45 +76,7 @@ services:
       retries: 10
     deploy:
       resources:
-        limits: { memory: 192m, cpus: "0.5" }   # 128 MB of data + Redis overhead
-    restart: unless-stopped
-    logging: *default-logging
-
-  kafka:
-    image: apache/kafka:4.1.0
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      # Only the internal listener: nothing outside the Docker network talks to Kafka.
-      KAFKA_LISTENERS: INTERNAL://:19092,CONTROLLER://:9093
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-      KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
-      KAFKA_LOG_DIRS: /var/lib/kafka/data
-      # Keep click events for 7 days or 1 GB per partition, whichever comes first,
-      # so the broker can't fill the server's disk. The worker normally
-      # consumes them within seconds; retention is the safety buffer for outages.
-      KAFKA_LOG_RETENTION_HOURS: 168
-      KAFKA_LOG_RETENTION_BYTES: 1073741824
-    volumes:
-      - kafka-data:/var/lib/kafka/data
-    networks: [backend]
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:19092 > /dev/null 2>&1"]
-      interval: 15s
-      timeout: 10s
-      retries: 12
-      start_period: 30s
-    deploy:
-      resources:
-        limits: { memory: 1g, cpus: "1.0" }     # 512 MB heap + JVM/page-cache overhead
+        limits: { memory: 128m, cpus: "0.5" }   # maxmemory + overhead + AOF rewrite headroom
     restart: unless-stopped
     logging: *default-logging
 
@@ -126,17 +98,16 @@ services:
     deploy:
       replicas: ${API_REPLICAS:-2}
       resources:
-        limits: { memory: 384m, cpus: "0.75" }
+        limits: { memory: 192m, cpus: "0.75" }
     environment:
       <<: *app-env
       SERVICE_NAME: url-shortener-api
       PORT: 3000
-      APP_BASE_URL: ${APP_BASE_URL:?APP_BASE_URL is required, e.g. https://short.example.com}
+      APP_BASE_URL: ${APP_BASE_URL:?APP_BASE_URL is required, e.g. http://<server-ip>}
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
       JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-1d}
-      # Secure cookies need HTTPS. Until TLS is set up (Phase 9), set COOKIE_SECURE=false.
+      # Secure cookies need HTTPS. Without TLS this must be false.
       COOKIE_SECURE: ${COOKIE_SECURE:-true}
-      REDIS_URL: redis://redis:6379/0
       TRUST_PROXY: 1
       DB_POOL_MAX: 10
     networks: [frontend, backend]
@@ -146,8 +117,6 @@ services:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
-      kafka:
         condition: service_started
     init: true
     stop_grace_period: 15s
@@ -159,19 +128,19 @@ services:
     environment:
       <<: *app-env
       SERVICE_NAME: analytics-worker
-      KAFKA_CONSUMER_GROUP: analytics-worker
-      DB_POOL_MAX: 5
+      CLICKS_CONSUMER_GROUP: analytics-worker
+      DB_POOL_MAX: 3
     networks: [backend]
     depends_on:
       migrate:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
-      kafka:
+      redis:
         condition: service_healthy
     deploy:
       resources:
-        limits: { memory: 256m, cpus: "0.5" }
+        limits: { memory: 160m, cpus: "0.5" }
     init: true
     stop_grace_period: 15s
     restart: unless-stopped
@@ -181,7 +150,6 @@ services:
     image: nginx:1.28-alpine
     ports:
       - "80:80"
-      # - "443:443"   # HTTPS, Phase 9
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     networks: [frontend]
@@ -195,19 +163,18 @@ services:
       retries: 3
     deploy:
       resources:
-        limits: { memory: 64m, cpus: "0.5" }
+        limits: { memory: 32m, cpus: "0.5" }
     restart: unless-stopped
     logging: *default-logging
 
 networks:
   frontend:
   backend:
-    # No route to the internet from this network: PostgreSQL, Redis, Kafka and
-    # the worker never need to make outbound connections, so a compromised
-    # container can't send data out or download tools. (The API can still reach
-    # nginx through the frontend network.)
+    # No route to the internet from this network: PostgreSQL, Redis and the
+    # worker never need outbound connections, so a compromised container can't
+    # send data out or download tools.
     internal: true
 
 volumes:
   postgres-data:
-  kafka-data:
+  redis-data:

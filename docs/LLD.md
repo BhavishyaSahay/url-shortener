@@ -2,7 +2,7 @@
 
 Implementation details and the reasoning behind them. For the big picture see [HLD.md](HLD.md).
 
-- [Kafka click events and the analytics worker](#kafka-click-events-and-the-analytics-worker)
+- [Click events: Redis Streams and the analytics worker](#click-events-redis-streams-and-the-analytics-worker)
 - [Redirect and caching (Redis)](#redirect-and-caching-redis)
 - [Rate limiting](#rate-limiting)
 - [Base62 short codes](#base62-short-codes)
@@ -11,11 +11,46 @@ Implementation details and the reasoning behind them. For the big picture see [H
 - [URL management and authorization](#url-management-and-authorization)
 - [Authentication](#authentication)
 
-## Kafka click events and the analytics worker
+## Click events: Redis Streams and the analytics worker
+
+### Why Redis Streams (and not Kafka)
+
+Phase 6 first used **Apache Kafka**. It worked and was tested end to end, but it was replaced to fit
+the deployment target, a 1 GB AWS t3.micro:
+
+| Measured (production stack, idle) | With Kafka | With Redis Streams |
+| --------------------------------- | ---------- | ------------------ |
+| Kafka broker (JVM) | 436 MiB | (none) |
+| Whole stack | **~695 MiB** | **~260 MiB** |
+
+Kafka alone used about two-thirds of the memory and would not fit on a 1 GB server next to
+PostgreSQL, Node and the OS. Redis was already running (cache and rate limits), and **Redis
+Streams** provides the same building blocks: an append-only log, consumer groups,
+acknowledgements, redelivery of unacknowledged entries, and taking over a dead consumer's work.
+The architecture (producer → queue → worker → PostgreSQL) and the idempotent processing are
+unchanged.
+
+| Concept | Kafka | Redis Streams (used) |
+| ------- | ----- | -------------------- |
+| Log | topic `url-clicks`, partitions on disk | stream key `url-clicks` (entries in memory, persisted by AOF) |
+| Write | `producer.send` | `XADD url-clicks MAXLEN ~ N * event <json>` |
+| Consumer group | yes, partitions assigned per consumer | yes, entries handed out one by one |
+| "Processed" | commit offset | `XACK` |
+| Not processed yet | offset not committed → redelivered | entry stays in the **pending entries list (PEL)** → retried |
+| Dead consumer | group rebalance after the session timeout | `XAUTOCLAIM` of entries idle > 60 s |
+| Retention | time/size on disk | `MAXLEN ~` cap (entries are also deleted once processed) |
+| Ordering | per partition (per key) | whole stream (per consumer, entries arrive in order) |
+| Scale ceiling | very high (distributed, replicated) | one Redis node's memory and CPU |
+
+**Trade-offs accepted:** Kafka is the better tool at real scale: disk-based retention for days,
+replication across brokers, replay for backfills, much higher throughput. For this project's
+volume and a single small server, Redis Streams provides the same guarantees we actually rely on
+at a fraction of the memory. If the system outgrew one Redis, moving back to Kafka changes only
+the producer call and the consumer loop.
 
 ### The event
 
-Published by the API to topic **`url-clicks`** after every successful `GET` redirect (not `HEAD`):
+Published by the API after every successful `GET` redirect (not `HEAD`):
 
 ```json
 {
@@ -33,127 +68,117 @@ Published by the API to topic **`url-clicks`** after every successful `GET` redi
 | ----- | --- |
 | `eventId` | A UUID per click. The worker's **deduplication key** (see idempotency) |
 | `urlId` + `shortCode` | Which link. The worker checks both still match a row, and skips events for deleted links |
-| `ipHash` | `HMAC-SHA256(ip)` with a key derived from `JWT_SECRET`. **The raw IP never leaves the API.** A plain SHA-256 of an IPv4 address can be reversed by hashing all ~4 billion addresses; a keyed HMAC can't be without the secret. Still enough to count unique visitors |
+| `ipHash` | `HMAC-SHA256(ip)` with a key derived from `JWT_SECRET`. **The raw IP never leaves the API.** A plain SHA-256 of an IPv4 address can be reversed by hashing all ~4 billion addresses; a keyed HMAC can't be without the secret |
 | `userAgent`, `referrer` | Truncated to 512 and 2048 chars. The worker derives `browser` and the referrer **host** only |
 
-The message **key is the short code**. Kafka picks the partition as `hash(key) % partitions`, so:
-
-- All clicks for one link go to the **same partition**, in order. (Seen in testing: all 5 clicks
-  for code `6` landed in partition 1, offsets 0–4.)
-- One partition is consumed by exactly one worker in the group, so **two workers never update the
-  same link's daily counter concurrently**: no lock contention, no deadlocks between workers.
-- Trade-off: one viral link is limited to one partition's throughput (a *hot partition*). At
-  real scale you'd key by `shortCode + random suffix` and merge the counts.
+It's stored in the stream as one field, `event`, containing the JSON. Redis assigns each entry an
+ID like `1727700000000-0` (milliseconds-sequence), always increasing.
 
 ### Producer: fire-and-forget
 
 ```js
 res.redirect(302, url.originalUrl);        // 1. the user gets their response
-void publishClickEvent(buildClickEvent()); // 2. then publish, NOT awaited
+void publishClickEvent(buildClickEvent()); // 2. then XADD, NOT awaited
 ```
 
-- The redirect never waits for Kafka, and a Kafka error can never turn into a failed redirect
+- The redirect never waits for Redis, and a Redis error can never turn into a failed redirect
   (`publishClickEvent` never throws).
-- **Not connected, then drop.** Kafka is optional for the API, like Redis: startup doesn't block
-  on it, and `connectProducer()` retries every 5 s in the background.
-- **Backpressure:** if the broker is slow or down, sends pile up while kafkajs retries. Beyond
-  1000 in flight, new events are dropped, so memory can't grow without bound.
-- Drops are logged as a summary (one line per 1000), not once per click. kafkajs's own repeated
-  errors are throttled to one per message per 30 s. Measured during an outage: 2 log lines
-  instead of dozens.
-- **Guarantee: at-most-once.** Events during a Kafka outage are lost, by design: analytics are
+- **Redis not ready → drop** the event immediately (the same fail-fast client as the cache).
+- **Backpressure:** at most 1000 writes in flight; beyond that, new events are dropped, so memory
+  can't grow without bound.
+- **`MAXLEN ~ 100000`** caps the stream. If the worker is down for a long time, the oldest unread
+  entries are trimmed instead of filling Redis's memory. `~` lets Redis trim in whole internal
+  blocks (cheap) rather than to exactly N.
+- **Guarantee: at-most-once.** Events during a Redis outage are lost, by design: analytics are
   best-effort and redirects are not. The *transactional outbox* pattern is the upgrade if events
   must never be lost.
-- `/ready` reports `kafka: down` if the producer isn't connected **or** a send failed in the last
-  30 s. kafkajs stays "connected" while the broker is gone, so failed sends are how we notice.
 
-### Consumer: batches, offsets, idempotency
+### Redis configured for a queue, not just a cache
+
+Holding a queue in Redis changes two settings that were fine for a pure cache:
+
+| Setting | Before (cache only) | Now | Why |
+| ------- | ------------------- | --- | --- |
+| Eviction | `allkeys-lru` | **`volatile-lru`** | With `allkeys-lru`, a full Redis could evict **the stream itself**, silently losing the whole queue. `volatile-lru` only evicts keys that have a TTL. Cache entries and rate-limit counters all do; the stream doesn't, so it's never evicted |
+| Persistence | off | **AOF, `appendfsync everysec`** + a data volume | Queued clicks survive a Redis restart. Verified: 3 clicks queued while the worker was stopped were still there after `docker compose restart redis`, and all were counted when the worker returned. At most ~1 s of writes can be lost in a crash |
+
+If memory fills up with only the stream left, `XADD` fails and the producer drops events. That's
+bounded by `MAXLEN`, and processed entries are deleted, so in normal operation the stream is
+nearly empty.
+
+### Consumer: the worker loop
 
 ```text
-poll batch from partition P
-  │
-  ├─ parse + validate each message (zod) ── invalid → log "poison message", skip
-  │
-  ├─ BEGIN
-  │    SELECT id, short_code FROM urls WHERE id IN (…)       -- drop events for deleted links
-  │    INSERT INTO click_events … ON CONFLICT (event_id) DO NOTHING RETURNING url_id, clicked_at
-  │    for each (url, day) among the NEWLY inserted rows, in sorted order:
-  │      INSERT INTO url_daily_stats … ON CONFLICT (url_id, day) DO UPDATE SET clicks = clicks + n
-  │  COMMIT
-  │
-  └─ return normally → kafkajs commits the batch's offsets
-     throw           → nothing committed, the batch is delivered again
+on start: XGROUP CREATE url-clicks analytics-worker 0 MKSTREAM   (idempotent)
+
+loop:
+  every 30 s:  XAUTOCLAIM … min-idle 60 s     take over entries stuck on a DEAD consumer
+  1. XREADGROUP … STREAMS url-clicks 0        my own pending entries first
+                                              (a failed batch, a crash before XACK, or just claimed)
+  2. if none: XREADGROUP … BLOCK 2000 … >     new entries, waiting up to 2 s for one to arrive
+  3. delivered more than 5 times?  →  copy to url-clicks:dead-letter, XACK (stop retrying)
+  4. parse + validate (zod). Malformed → log, and acknowledge with the rest
+  5. storeClickEvents(batch)                  ONE transaction (unchanged from the Kafka version)
+  6. MULTI  XACK + XDEL  EXEC                 only after the DB commit
+  on error: log, back off (1 s, 2 s, 4 s … max 30 s); the entries stay pending and are retried
 ```
 
-**Offsets and delivery semantics.** A consumer group stores, per partition, "processed up to
-offset X". The order of *process* and *commit* decides the guarantee:
+- **A separate Redis connection.** `XREADGROUP … BLOCK` holds its connection until data arrives,
+  so the worker uses its own client (`createBlockingRedisClient`). That client has no command
+  timeout, and commands wait for a reconnect rather than failing. The API's client has a 500 ms
+  fail-fast timeout that would abort every blocking read.
+- **Consumer name** = hostname + PID (in Docker the hostname is the container ID), so every worker
+  instance is a distinct consumer.
+- **Start ID `0`:** a newly created group processes everything already in the stream (like Kafka's
+  `fromBeginning`). After that the group remembers what it has delivered.
+- **`XDEL` after `XACK`:** with one consumer group, a processed entry is never needed again.
+  Deleting it keeps the stream (and Redis memory) tiny in normal operation, so `MAXLEN` only
+  matters while the worker is down.
+
+**Delivery semantics.** An entry is delivered, processed, and only then acknowledged:
 
 | Order | If the worker crashes between the two steps | Guarantee |
 | ----- | ------------------------------------------- | --------- |
-| Commit, then process | Batch never processed | at-most-once (loses data) |
-| **Process, then commit** (used) | Batch processed again after restart | **at-least-once** (duplicates possible) |
+| Acknowledge, then process | Entry never processed | at-most-once (loses data) |
+| **Process, then acknowledge** (used) | Entry processed again later | **at-least-once** (duplicates possible) |
 
 At-least-once plus **idempotent processing** gives exactly-once *effects*:
 
 - `click_events.event_id` is `UNIQUE`, so a redelivered event hits `ON CONFLICT DO NOTHING`.
-- The rollup is incremented only from the rows that insert **returned** (the new ones), so a
-  replayed batch adds 0.
-- Raw insert and rollup are in **one transaction**. They can't disagree, and a failure rolls back
-  both.
-- Tested three ways: replaying a whole batch, a partially duplicated batch, and publishing the
-  same event twice through real Kafka. Each click is counted exactly once.
+- The daily rollup is incremented only from the rows that insert **returned** (the new ones).
+- Raw insert and rollup are in **one transaction**, so they can't disagree.
 
-**Why `eachBatch`, not `eachMessage`:** one transaction per batch instead of per click is far
-fewer round trips. With `eachBatchAutoResolve` (the default), a batch is committed only if the
-handler returns.
+**Failure handling, all tested** (`tests/integration/clickStream.e2e.test.js`):
 
-**Deadlock avoidance:** rollup upserts run in a fixed order (url_id, day). And because of key
-partitioning, two workers never touch the same link's rows anyway.
+| Situation | What happens | Test |
+| --------- | ------------ | ---- |
+| Worker down | Entries wait in the stream. Redirects are unaffected | 3 clicks buffered, then processed when the worker starts |
+| Same event delivered twice | Second insert skipped | Counted once |
+| Malformed entry (poison message) | Logged, acknowledged, skipped. Entries behind it aren't blocked | Bad JSON entry, then a real click: counted, nothing left pending |
+| Worker crashes after reading, before `XACK` | Entry stays pending on the dead consumer; another worker claims it with `XAUTOCLAIM` after it has been idle 60 s | A fake "crashed-worker" holds an entry; a new worker claims and processes it |
+| Batch keeps failing (e.g. one event breaks the transaction) | Retried with backoff; after 5 deliveries moved to `url-clicks:dead-letter` and acknowledged, so the queue isn't blocked forever | A `store` that always throws: entry ends in the dead-letter stream, nothing pending |
+| PostgreSQL down | Batches fail, entries stay pending, retried with backoff until it returns | (backoff path of the same loop) |
+| Redis down | The worker's commands wait for the reconnect; the producer drops events | |
 
-### Worker lifecycle: "let it crash"
+**A poison message found while porting:** the event schema accepted any positive `urlId`, but the
+column is a 32-bit `INTEGER`. An event with `urlId: 9999999999` would have made **every** batch
+containing it fail, forever. The schema now caps `urlId` at 2,147,483,647, and the dead-letter
+stream is the safety net for anything validation still misses.
+
+**Concurrency without partitions.** Kafka sent all clicks for one link to the same partition, and
+therefore the same worker. A Redis consumer group hands entries to any consumer, so two workers
+*can* update the same link's daily counter at the same time. That's still safe:
+`INSERT … ON CONFLICT DO UPDATE SET clicks = clicks + n` takes a row lock, so concurrent
+increments serialize instead of overwriting each other, and upserts run in a fixed
+`(url_id, day)` order so two transactions can't deadlock.
+
+### Worker lifecycle
 
 | Situation | Behaviour |
 | --------- | --------- |
-| Startup | Wait for PostgreSQL (retry), then create the topic if missing (idempotent, retry until Kafka answers), then join the group. Unlike the API, the worker genuinely needs both |
-| Transient Kafka/DB error | kafkajs retries (5×, exponential backoff) |
-| Retries exhausted | Consumer **crashes, and the process exits with code 1**. The supervisor (Docker `restart: unless-stopped`, ECS, Kubernetes) starts a fresh process, which resumes from the last committed offset |
-| SIGTERM | `consumer.disconnect()`: finish the batch, commit, leave the group cleanly (partitions reassigned immediately), close the DB pool |
-
-**Why not let kafkajs restart the consumer in-process?** Tested: after a broker restart, kafkajs's
-internal restart hit `The coordinator is loading…`, scheduled another restart, and then **hung
-silently**. It never rejoined the group, so new clicks sat unconsumed in Kafka. Exiting and
-letting a supervisor start a clean process is simpler and more robust. The same test with a
-supervisor loop recovered on its own and counted every post-outage click.
-
-**`sessionTimeout: 10 s`.** A crashed worker can't leave its group politely, so the group only
-reassigns its partitions once heartbeats have been missing for `sessionTimeout`. Measured with
-the 30 s kafkajs default: the restarted worker waited exactly 30 s before consuming. 10 s (with a
-3 s heartbeat) recovers faster, but tolerates less: a batch or GC pause longer than 10 s without
-a heartbeat triggers a rebalance.
-
-### Partitions and scaling
-
-- The topic has **3 partitions**. Consumers in one group split them, so up to 3 worker instances
-  can consume in parallel. A 4th would be idle, and more partitions would be the next step.
-- **Ordering** is guaranteed only *within* a partition. That's all we need, since everything
-  about one link is in one partition.
-- Topics are created deliberately: broker auto-creation is off, and the worker creates
-  `url-clicks` idempotently at startup. A typo in a topic name fails loudly instead of creating a
-  new empty topic.
-
-### Why kafkajs, and its known limits
-
-- Chosen over `@confluentinc/kafka-javascript` (Confluent's maintained client, built on
-  librdkafka): on this machine that package **compiled librdkafka and OpenSSL from C++ source**
-  for several minutes, because there's no prebuilt binary for Node 25 on Apple Silicon. That's
-  heavy for a project meant to be cloned and run, and for Docker and CI builds.
-- kafkajs is pure JavaScript with zero dependencies, and the most widely documented Node client.
-  **Verified against Kafka 4.1**: topic admin, produce, and consumer groups all work.
-- **Caveat:** kafkajs has had no release since February 2023, and its restart logic was the
-  weak spot found above, worked around with "let it crash". It prints a harmless
-  `Timeout duration was set to 1` warning on newer Node versions. The migration path is the
-  Confluent client, which offers a kafkajs-compatible API; the producer, consumer group and
-  `eachBatch` concepts carry over unchanged.
+| Startup | Health endpoint up, then wait for PostgreSQL (retry), then create the group if missing (waits for Redis), then consume |
+| SIGTERM | Stop the loop. The current blocking read returns within 2 s and the batch in progress finishes and is acknowledged. Close Redis and the DB pool. Anything unacknowledged stays pending for next time |
+| Process dies | Docker's restart policy starts a new one. Its pending entries are claimed by whichever worker runs `XAUTOCLAIM` |
 
 ## Redirect and caching (Redis)
 

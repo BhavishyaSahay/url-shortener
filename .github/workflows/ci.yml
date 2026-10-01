@@ -65,7 +65,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
-    # Real PostgreSQL, Redis and Kafka, started by GitHub Actions before the job.
+    # Real PostgreSQL and Redis, started by GitHub Actions before the job.
     # Same host ports as local development, so the test config works unchanged.
     services:
       postgres:
@@ -86,35 +86,10 @@ jobs:
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 3s --health-retries 10
 
-      kafka:
-        image: apache/kafka:4.1.0
-        env:
-          KAFKA_NODE_ID: "1"
-          KAFKA_PROCESS_ROLES: broker,controller
-          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
-          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-          # The tests run on the runner itself (not in a container), so a single
-          # listener advertised as localhost:9092 is all that's needed here.
-          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
-          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
-          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
-          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
-          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
-          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
-          KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
-        ports: ["9092:9092"]
-        options: >-
-          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
-          --health-interval 10s --health-timeout 10s --health-retries 12 --health-start-period 20s
-
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5433/url_shortener_test
       TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5433/url_shortener_test
       TEST_REDIS_URL: redis://localhost:6380/1
-      TEST_KAFKA_BROKERS: localhost:9092
 
     steps:
       - uses: actions/checkout@v7
@@ -200,7 +175,7 @@ jobs:
           docker compose ps
 
       # Proves the IMAGES work, not just the code: config defaults, native
-      # modules, networking, migrations, Kafka → worker. (A container-only
+      # modules, networking, migrations, Redis Stream → worker. (A container-only
       # config bug in Phase 7 passed every unit/integration test.)
       - name: Smoke test through Nginx
         run: scripts/smoke-test.sh http://localhost:8080

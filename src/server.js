@@ -1,6 +1,5 @@
 import { config } from './config/env.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
-import { connectProducer, disconnectProducer } from './config/kafka.js';
 import { connectRedis, disconnectRedis } from './config/redis.js';
 import { logger } from './utils/logger.js';
 import { createApp } from './app.js';
@@ -19,7 +18,6 @@ async function start() {
 
   await connectDatabase(); // required: waits/retries, exits if it never comes up
   await connectRedis(); // optional: never blocks startup, reconnects in the background
-  await connectProducer(); // optional: same, redirects work without Kafka
 
   server = app.listen(config.port, () => {
     logger.info({ port: config.port, env: config.env }, 'API server listening');
@@ -64,8 +62,8 @@ async function shutdown(signal) {
 
     // Close external clients only after in-flight requests have finished,
     // because those requests may still need the database.
-    // The producer flushes any click events still in flight before closing.
-    await Promise.all([disconnectDatabase(), disconnectRedis(), disconnectProducer()]);
+    // QUIT waits for pending Redis replies, including click events still being written.
+    await Promise.all([disconnectDatabase(), disconnectRedis()]);
 
     logger.info('Shutdown complete');
     process.exit(0);

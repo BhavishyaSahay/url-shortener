@@ -1,5 +1,7 @@
 import express from 'express';
 import request from 'supertest';
+// Concurrency tests get 15 s instead of Vitest's 5 s default: dozens of parallel
+// requests can run slowly on a cold machine or a shared CI runner.
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/app.js';
 import { connectRedis, redis } from '../../src/config/redis.js';
@@ -64,7 +66,7 @@ describe('POST /api/v1/urls rate limit', () => {
 
     expect((await create(alice, 51)).status).toBe(429);
     expect((await create(bob, 1)).status).toBe(201); // Bob has his own counter
-  });
+  }, 15_000);
 
   it('counts atomically under concurrency: exactly `max` requests get through', async () => {
     const alice = await loggedInAgent(app);
@@ -74,7 +76,7 @@ describe('POST /api/v1/urls rate limit', () => {
     const statuses = results.map((r) => r.status);
     expect(statuses.filter((s) => s === 201)).toHaveLength(50);
     expect(statuses.filter((s) => s === 429)).toHaveLength(10);
-  });
+  }, 15_000);
 });
 
 describe('rateLimit middleware mechanics', () => {

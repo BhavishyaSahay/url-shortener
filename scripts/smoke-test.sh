@@ -4,7 +4,7 @@
 #   scripts/smoke-test.sh [BASE_URL] [--read-only]
 #
 #   full (default)  health, readiness, register, create link, redirect, and a click
-#                   reaching analytics through Kafka and the worker.
+#                   reaching analytics through the Redis Stream and the worker.
 #                   Used in CI against the Docker Compose stack.
 #   --read-only     health + readiness only: creates no data.
 #                   Used by CD against production after a deploy.
@@ -60,11 +60,11 @@ redirect="$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' "$BASE_URL/$
 [[ "$redirect" == "302 https://example.com/smoke-test" ]] || fail "redirect returned: $redirect"
 pass "GET /$code → 302 https://example.com/smoke-test"
 
-# The click travels API → Kafka → worker → PostgreSQL asynchronously.
+# The click travels API → Redis Stream → worker → PostgreSQL asynchronously.
 for attempt in $(seq 1 30); do
   clicks="$(curl -fsS -b "$COOKIES" "$BASE_URL/api/v1/urls/$id/analytics" | json_field totalClicks)"
   [[ "${clicks:-0}" -ge 1 ]] && break
-  [[ $attempt -eq 30 ]] && fail "click never reached analytics (Kafka → worker pipeline) within 30 s"
+  [[ $attempt -eq 30 ]] && fail "click never reached analytics (Redis Stream → worker pipeline) within 30 s"
   sleep 1
 done
 pass "click processed by the analytics worker (totalClicks=$clicks)"

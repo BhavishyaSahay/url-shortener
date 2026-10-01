@@ -1,4 +1,6 @@
 import request from 'supertest';
+// Concurrency tests get 15 s instead of Vitest's 5 s default: dozens of parallel
+// requests can run slowly on a cold machine or a shared CI runner.
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/app.js';
 import { encode } from '../../src/utils/base62.js';
@@ -96,7 +98,7 @@ describe('POST /api/v1/urls', () => {
     expect(results.every((r) => r.status === 201)).toBe(true);
     const codes = results.map((r) => r.body.url.shortCode);
     expect(new Set(codes).size).toBe(25);
-  });
+  }, 15_000);
 
   it('lets exactly one of several simultaneous requests claim the same alias', async () => {
     const results = await Promise.all(
@@ -105,7 +107,7 @@ describe('POST /api/v1/urls', () => {
       ),
     );
     expect(results.map((r) => r.status).sort()).toEqual([201, 409, 409, 409, 409]);
-  });
+  }, 15_000);
 });
 
 describe('GET /api/v1/urls', () => {

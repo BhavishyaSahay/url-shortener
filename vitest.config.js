@@ -1,8 +1,8 @@
 import { defineConfig } from 'vitest/config';
 import { TEST_DATABASE_URL, TEST_REDIS_URL } from './tests/setup/test-database.js';
 
-// A fresh Kafka topic and consumer group per test run (the e2e test deletes the
-// topic afterwards). Events left over from an earlier run can never leak in.
+// A fresh click stream and consumer group per test run, so events left over
+// from an earlier run can never leak in.
 const runId = Date.now();
 
 export default defineConfig({
@@ -22,9 +22,8 @@ export default defineConfig({
       RATE_LIMIT_LOGIN_WINDOW: '15m',
       RATE_LIMIT_CREATE_URL_MAX: '50',
       RATE_LIMIT_CREATE_URL_WINDOW: '1m',
-      KAFKA_BROKERS: process.env.TEST_KAFKA_BROKERS ?? 'localhost:9092',
-      KAFKA_CLICKS_TOPIC: `url-clicks-test-${runId}`,
-      KAFKA_CONSUMER_GROUP: `analytics-worker-test-${runId}`,
+      CLICKS_STREAM: `url-clicks-test-${runId}`,
+      CLICKS_CONSUMER_GROUP: `analytics-worker-test-${runId}`,
     },
     projects: [
       {

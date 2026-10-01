@@ -7,10 +7,12 @@ import { prisma } from '../src/config/database.js';
 
 // The contract between the API (producer) and this worker (consumer). Messages
 // that don't match are "poison messages": logged and skipped, so one bad message
-// can't block the whole partition forever.
+// can't block the queue forever.
 const clickEventSchema = z.object({
   eventId: z.uuid(),
-  urlId: z.number().int().positive(),
+  // Capped at PostgreSQL INTEGER's max: a larger ID would make the whole batch's
+  // INSERT fail, every time it's retried (a poison message validation must catch).
+  urlId: z.number().int().positive().max(2_147_483_647),
   shortCode: z.string().min(1).max(32),
   timestamp: z.iso.datetime(),
   ipHash: z.string().max(64).nullable(),
@@ -18,10 +20,10 @@ const clickEventSchema = z.object({
   referrer: z.string().max(2048).nullable(),
 });
 
-/** Parse a Kafka message value into a click event, or null if it's malformed. */
+/** Parse a stream entry's "event" field (a JSON string) into a click event, or null if it's malformed. */
 export function parseClickEvent(value) {
   try {
-    const result = clickEventSchema.safeParse(JSON.parse(value.toString()));
+    const result = clickEventSchema.safeParse(JSON.parse(String(value)));
     return result.success ? result.data : null;
   } catch {
     return null;
@@ -89,10 +91,10 @@ export function countClicksByUrlAndDay(clicks) {
  *        INSERT … ON CONFLICT (url_id, day) DO UPDATE SET clicks = clicks + n
  *
  * If anything fails, the whole batch rolls back and throws. The consumer then
- * does NOT commit the Kafka offset, and Kafka redelivers the batch. Because of
- * steps 2 and 3, processing a batch twice gives the same result as once
- * (idempotent), which turns Kafka's at-least-once delivery into exactly-once
- * EFFECTS in our database.
+ * does NOT acknowledge (XACK) the entries, so they stay pending and are
+ * retried. Because of steps 2 and 3, processing a batch twice gives the same
+ * result as once (idempotent), which turns the queue's at-least-once delivery
+ * into exactly-once EFFECTS in our database.
  *
  * @returns {Promise<{received: number, inserted: number, duplicates: number, skippedMissingUrl: number}>}
  */

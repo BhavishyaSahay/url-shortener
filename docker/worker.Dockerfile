@@ -41,7 +41,7 @@ WORKDIR /app
 
 COPY --from=prod-deps /app/node_modules ./node_modules
 COPY package.json ./
-# The worker reuses the API's config, Prisma client, Kafka client and logger.
+# The worker reuses the API's config, Prisma client, Redis client and logger.
 COPY src ./src
 COPY worker ./worker
 

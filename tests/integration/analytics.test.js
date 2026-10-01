@@ -6,9 +6,9 @@ import { storeClickEvents } from '../../worker/analytics.processor.js';
 import { loggedInAgent } from '../helpers/auth.js';
 import { prisma, resetTables } from '../helpers/db.js';
 
-// These tests drive the worker's processor directly (no Kafka), to check the
-// database logic and the analytics API precisely. tests/integration/kafka.e2e.test.js
-// covers the real Kafka path.
+// These tests drive the worker's processor directly (no stream), to check the
+// database logic and the analytics API precisely. tests/integration/clickStream.e2e.test.js
+// covers the real Redis Stream path.
 
 const app = createApp();
 const DAY = 24 * 60 * 60 * 1000;
@@ -46,7 +46,7 @@ describe('storeClickEvents (worker → PostgreSQL)', () => {
     const batch = [click(), click(), click()];
     await storeClickEvents(batch);
 
-    // Kafka redelivers after a crash before the offset commit (at-least-once).
+    // The queue redelivers entries that were never acknowledged, e.g. after a crash (at-least-once).
     const replay = await storeClickEvents(batch);
 
     expect(replay).toMatchObject({ inserted: 0, duplicates: 3 });

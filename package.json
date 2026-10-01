@@ -1,7 +1,7 @@
 {
   "name": "url-shortener",
   "version": "0.1.0",
-  "description": "A scalable URL shortener built with Express, PostgreSQL, Redis and Kafka",
+  "description": "A scalable URL shortener built with Express, PostgreSQL and Redis (cache, rate limits, Streams)",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
@@ -39,7 +39,6 @@
     "helmet": "^8.3.0",
     "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.3",
-    "kafkajs": "^2.2.4",
     "pg": "^8.23.0",
     "pino": "^10.3.1",
     "pino-http": "^11.0.0",

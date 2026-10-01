@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { config } from '../config/env.js';
-import { isProducerConnected, markSendFailed, markSendSucceeded, producer } from '../config/kafka.js';
+import { isRedisReady, redis } from '../config/redis.js';
 import { logger } from '../utils/logger.js';
 
 // ---------------------------------------------------------------------------
@@ -22,7 +22,7 @@ function hashIp(ip) {
 const truncate = (value, max) => (typeof value === 'string' && value.length > 0 ? value.slice(0, max) : null);
 
 /**
- * The event published to Kafka for every successful redirect.
+ * The event published for every successful redirect.
  * eventId is unique per click; the worker uses it to ignore duplicate deliveries.
  */
 export function buildClickEvent({ url, shortCode, ip, userAgent, referrer, now = new Date() }) {
@@ -38,12 +38,11 @@ export function buildClickEvent({ url, shortCode, ip, userAgent, referrer, now =
 }
 
 // ---------------------------------------------------------------------------
-// Publishing: fire-and-forget
+// Publishing to the Redis Stream: fire-and-forget
 // ---------------------------------------------------------------------------
 
-// Backpressure: if Kafka is slow or down, sends pile up while they retry.
-// Beyond this many in flight, new events are dropped instead of letting
-// memory grow without bound.
+// Backpressure: if Redis is slow, writes pile up. Beyond this many in flight,
+// new events are dropped instead of letting memory grow without bound.
 const MAX_IN_FLIGHT = 1_000;
 let inFlight = 0;
 let droppedSinceLastLog = 0;
@@ -57,17 +56,24 @@ function drop(reason) {
 }
 
 /**
- * Publish a click event WITHOUT making the redirect wait. The caller doesn't
- * await this: the user already has their 302 by the time Kafka answers.
- * It never throws; failures are logged and the event is dropped.
- * (Analytics are "best effort": losing a few clicks during a Kafka outage
- * is acceptable, slowing down or breaking redirects is not.)
+ * Append a click event to the stream WITHOUT making the redirect wait. The
+ * caller doesn't await this: the user already has their 302 by the time Redis
+ * answers. It never throws; failures are logged and the event is dropped.
+ * (Analytics are "best effort": losing a few clicks during a Redis outage is
+ * acceptable, slowing down or breaking redirects is not.)
  *
- * @returns {Promise<boolean>} resolves true if Kafka acknowledged the event (awaited only in tests)
+ *   XADD url-clicks MAXLEN ~ 100000 * event <json>
+ *
+ *   *            Redis assigns the entry ID: "<milliseconds>-<sequence>", always increasing
+ *   MAXLEN ~ N   trim to roughly the newest N entries, so a stopped worker can't
+ *                fill Redis's memory. "~" lets Redis trim efficiently in whole
+ *                blocks instead of exactly N.
+ *
+ * @returns {Promise<boolean>} true if Redis accepted the event (awaited only in tests)
  */
 export async function publishClickEvent(event) {
-  if (!isProducerConnected()) {
-    drop('producer not connected');
+  if (!isRedisReady()) {
+    drop('redis not connected');
     return false;
   }
   if (inFlight >= MAX_IN_FLIGHT) {
@@ -77,19 +83,10 @@ export async function publishClickEvent(event) {
 
   inFlight++;
   try {
-    await producer.send({
-      topic: config.kafka.clicksTopic,
-      // The KEY decides the partition (hash(key) % partitions). Using the short
-      // code means all clicks for one link land in the same partition, in order,
-      // handled by one worker, so two workers never update the same link's
-      // daily counter at the same time.
-      messages: [{ key: event.shortCode, value: JSON.stringify(event) }],
-    });
-    markSendSucceeded();
+    await redis.xadd(config.clicks.stream, 'MAXLEN', '~', config.clicks.maxLength, '*', 'event', JSON.stringify(event));
     droppedSinceLastLog = 0;
     return true;
   } catch (err) {
-    markSendFailed();
     drop(err.message);
     return false;
   } finally {

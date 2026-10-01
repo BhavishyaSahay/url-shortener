@@ -44,7 +44,7 @@ Analytics tables (Phase 6, migration `add_click_analytics`), written only by the
 - **`click_events`**: one row per click, the detailed record behind referrers, browsers and
   unique visitors.
   - `BIGSERIAL`, because clicks outnumber URLs by orders of magnitude.
-  - `event_id UNIQUE` makes the worker idempotent under Kafka's at-least-once delivery.
+  - `event_id UNIQUE` makes the worker idempotent under the queue's at-least-once delivery.
   - Only an HMAC of the IP and the referrer *host* are stored (data minimization).
 - **`url_daily_stats`**: a pre-aggregated rollup with a composite PK `(url_id, day)`. The
   "clicks per day" chart reads about 30 tiny rows instead of counting millions of events. The

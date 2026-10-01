@@ -5,7 +5,7 @@ const url = { id: 42 };
 const base = { url, shortCode: 'aB92x', ip: '203.0.113.7', userAgent: 'Mozilla/5.0', referrer: 'https://twitter.com/x' };
 
 describe('buildClickEvent', () => {
-  it('builds the event published to Kafka', () => {
+  it('builds the event published to the click stream', () => {
     const now = new Date('2026-09-29T10:00:00Z');
     const event = buildClickEvent({ ...base, now });
 
@@ -45,7 +45,7 @@ describe('buildClickEvent', () => {
   });
 });
 
-describe('publishClickEvent without a Kafka connection', () => {
+describe('publishClickEvent without a Redis connection', () => {
   it('drops the event immediately instead of waiting or throwing', async () => {
     const started = performance.now();
     await expect(publishClickEvent(buildClickEvent(base))).resolves.toBe(false);

@@ -26,7 +26,7 @@ export async function redirect(req, res) {
   res.redirect(302, url.originalUrl);
 
   // Analytics happen AFTER the response is sent, and are not awaited: the
-  // user never waits for Kafka, and a Kafka failure can't break the redirect.
+  // user never waits for Redis, and a Redis failure can't break the redirect.
   // HEAD requests (link checkers, some previewers) aren't counted as clicks.
   if (req.method === 'GET') {
     void publishClickEvent(
