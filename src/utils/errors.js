@@ -1,67 +1,26 @@
-// Application errors. Services throw these; the error middleware turns them
-// into consistent JSON responses. Anything that is NOT an AppError is treated
-// as an unexpected bug and returned as a generic 500.
-
+// Errors with an HTTP status. Services throw these; the error middleware turns
+// them into JSON responses. Any other error is treated as a bug → 500.
 export class AppError extends Error {
-  /**
-   * @param {number} statusCode HTTP status code
-   * @param {string} code       Stable machine-readable code clients can rely on
-   * @param {string} message    Human-readable message (safe to show to clients)
-   * @param {unknown} [details] Optional extra info, e.g. validation issues
-   */
   constructor(statusCode, code, message, details) {
     super(message);
-    this.name = this.constructor.name;
     this.statusCode = statusCode;
     this.code = code;
     this.details = details;
   }
 }
 
-export class ValidationError extends AppError {
-  constructor(message = 'Invalid request', details) {
-    super(400, 'VALIDATION_ERROR', message, details);
-  }
+export const ValidationError = (message, details) => new AppError(400, 'VALIDATION_ERROR', message, details);
+export const UnauthorizedError = (message = 'Authentication required') => new AppError(401, 'UNAUTHORIZED', message);
+export const NotFoundError = (message = 'Not found') => new AppError(404, 'NOT_FOUND', message);
+export const ConflictError = (message) => new AppError(409, 'CONFLICT', message);
+export const GoneError = (message) => new AppError(410, 'GONE', message);
+
+export function TooManyRequestsError(retryAfterSeconds) {
+  const err = new AppError(429, 'RATE_LIMITED', 'Too many requests, please try again later');
+  err.retryAfterSeconds = retryAfterSeconds;
+  return err;
 }
 
-export class UnauthorizedError extends AppError {
-  constructor(message = 'Authentication required') {
-    super(401, 'UNAUTHORIZED', message);
-  }
-}
-
-export class ForbiddenError extends AppError {
-  constructor(message = 'You do not have permission to perform this action') {
-    super(403, 'FORBIDDEN', message);
-  }
-}
-
-export class NotFoundError extends AppError {
-  constructor(message = 'Resource not found') {
-    super(404, 'NOT_FOUND', message);
-  }
-}
-
-export class ConflictError extends AppError {
-  constructor(message = 'Resource already exists') {
-    super(409, 'CONFLICT', message);
-  }
-}
-
-export class GoneError extends AppError {
-  constructor(message = 'Resource is no longer available') {
-    super(410, 'GONE', message);
-  }
-}
-
-// Prisma error code for a unique constraint violation (e.g. duplicate email or short code).
-export const isUniqueConstraintError = (err) => err?.code === 'P2002';
-// Prisma error code when an update/delete matched no row.
-export const isRecordNotFoundError = (err) => err?.code === 'P2025';
-
-export class TooManyRequestsError extends AppError {
-  constructor(message = 'Too many requests, please try again later', retryAfterSeconds) {
-    super(429, 'RATE_LIMITED', message);
-    this.retryAfterSeconds = retryAfterSeconds;
-  }
-}
+// Prisma error codes
+export const isUniqueViolation = (err) => err?.code === 'P2002'; // unique constraint failed
+export const isRecordNotFound = (err) => err?.code === 'P2025'; // update/delete matched no row

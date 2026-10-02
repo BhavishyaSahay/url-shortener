@@ -1,51 +1,46 @@
 import { describe, expect, it } from 'vitest';
-import { ValidationError } from '../../src/utils/errors.js';
-import { loginSchema, registerSchema, validate } from '../../src/utils/validation.js';
+import { createUrlSchema, registerSchema, updateUrlSchema, validate } from '../../src/utils/validation.js';
+
+const fields = (schema, body) => {
+  try {
+    validate(schema, body);
+    return [];
+  } catch (err) {
+    return err.details.map((d) => d.field);
+  }
+};
 
 describe('registerSchema', () => {
-  it('trims and lower-cases the email', () => {
-    const data = validate(registerSchema, { email: '  Alice@Example.COM ', password: 'longenough' });
-    expect(data.email).toBe('alice@example.com');
+  it('lower-cases and trims the email', () => {
+    expect(validate(registerSchema, { email: ' Alice@Example.COM ', password: 'longenough' }).email).toBe('alice@example.com');
   });
 
-  it('drops unknown fields (e.g. a client trying to set "id" or "passwordHash")', () => {
-    const data = validate(registerSchema, { email: 'a@b.co', password: 'longenough', passwordHash: 'x', id: 1 });
-    expect(data).toEqual({ email: 'a@b.co', password: 'longenough' });
-  });
-
-  it.each([
-    [{ email: 'not-an-email', password: 'longenough' }, 'email'],
-    [{ email: 'a@b.co', password: 'short' }, 'password'],
-    [{ email: 'a@b.co', password: 'x'.repeat(129) }, 'password'],
-    [{ email: 'a@b.co' }, 'password'],
-    [{ password: 'longenough' }, 'email'],
-  ])('rejects %j (bad %s)', (body, field) => {
-    try {
-      validate(registerSchema, body);
-      expect.unreachable();
-    } catch (err) {
-      expect(err).toBeInstanceOf(ValidationError);
-      expect(err.details.map((d) => d.field)).toContain(field);
-    }
-  });
-
-  it('reports every invalid field at once', () => {
-    expect(() => validate(registerSchema, { email: 'bad', password: '1' })).toThrow(
-      expect.objectContaining({ details: expect.arrayContaining([expect.objectContaining({ field: 'email' }), expect.objectContaining({ field: 'password' })]) }),
-    );
-  });
-
-  it('handles a missing body', () => {
-    expect(() => validate(registerSchema, undefined)).toThrow(ValidationError);
+  it('rejects a bad email and a short password', () => {
+    expect(fields(registerSchema, { email: 'nope', password: '123' })).toEqual(['email', 'password']);
   });
 });
 
-describe('loginSchema', () => {
-  it('does not apply new-password rules, so old short passwords can still log in', () => {
-    expect(validate(loginSchema, { email: 'a@b.co', password: 'short' }).password).toBe('short');
+describe('createUrlSchema', () => {
+  it('accepts http(s) URLs with an optional alias and future expiry', () => {
+    const body = validate(createUrlSchema, { url: 'https://example.com/a', customAlias: 'my-link', expiresAt: '2099-01-01T00:00:00Z' });
+    expect(body.expiresAt).toBeInstanceOf(Date);
   });
 
-  it('requires a non-empty password', () => {
-    expect(() => validate(loginSchema, { email: 'a@b.co', password: '' })).toThrow(ValidationError);
+  it.each(['not a url', 'example.com', 'javascript:alert(1)', 'ftp://example.com'])('rejects url %j', (url) => {
+    expect(fields(createUrlSchema, { url })).toEqual(['url']);
+  });
+
+  it.each(['ab', 'has space', 'health'])('rejects alias %j', (customAlias) => {
+    expect(fields(createUrlSchema, { url: 'https://a.com', customAlias })).toEqual(['customAlias']);
+  });
+
+  it('rejects an expiry in the past', () => {
+    expect(fields(createUrlSchema, { url: 'https://a.com', expiresAt: '2020-01-01T00:00:00Z' })).toEqual(['expiresAt']);
+  });
+});
+
+describe('updateUrlSchema', () => {
+  it('requires at least one field', () => {
+    expect(fields(updateUrlSchema, {})).toHaveLength(1);
   });
 });

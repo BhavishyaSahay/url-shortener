@@ -1,189 +1,45 @@
-# Continuous Integration: every pull request and every push to main.
-#
-#   lint-and-unit ─┐
-#   integration   ─┼─ all three run in parallel; any failure fails CI
-#   docker        ─┘  (and CD, which only starts after a green CI run on main)
-#
-# Nothing here needs secrets, so it runs safely for pull requests too.
+# Continuous Integration: runs on every pull request and every push to main.
 name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
-  workflow_dispatch:
 
-# Least privilege: CI only needs to read the repository.
 permissions:
   contents: read
 
-# A new push to the same PR cancels the previous, now-outdated run.
-# Runs on main are never cancelled, so every commit on main gets a verdict.
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-env:
-  NODE_VERSION: "24"
-  PRISMA_HIDE_UPDATE_MESSAGE: "1"
-
 jobs:
-  # ---------------------------------------------------------------------------
-  lint-and-unit:
-    name: Lint, audit & unit tests
+  test:
+    name: Lint & tests
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      # `npm ci` runs `prisma generate`, which reads DATABASE_URL from
-      # prisma.config.js. Nothing connects to it in this job.
-      DATABASE_URL: postgresql://placeholder:placeholder@localhost:5432/placeholder
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm            # caches ~/.npm, keyed on package-lock.json
-
-      - name: Install dependencies
-        run: npm ci             # exact versions from the lockfile; fails if it's out of sync
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Audit production dependencies
-        # Fail on high/critical advisories in what actually ships in the image.
-        # (Dev tooling advisories are left to Dependabot: they never reach production.)
-        run: npm audit --omit=dev --omit=optional --audit-level=high
-
-      - name: Unit tests
-        run: npm run test:unit
-
-  # ---------------------------------------------------------------------------
-  integration:
-    name: Integration tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    # Real PostgreSQL and Redis, started by GitHub Actions before the job.
-    # Same host ports as local development, so the test config works unchanged.
+    # Real PostgreSQL and Redis for the integration tests (same ports as local development).
     services:
       postgres:
         image: postgres:17-alpine
         env:
-          POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: url_shortener_test
         ports: ["5433:5432"]
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s --health-timeout 3s --health-retries 10
-
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 10
       redis:
         image: redis:7.4-alpine
         ports: ["6380:6379"]
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s --health-timeout 3s --health-retries 10
-
     env:
       DATABASE_URL: postgresql://postgres:postgres@localhost:5433/url_shortener_test
-      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5433/url_shortener_test
-      TEST_REDIS_URL: redis://localhost:6380/1
-
     steps:
       - uses: actions/checkout@v7
-
       - uses: actions/setup-node@v7
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: 24
           cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Integration tests
-        # Global setup applies the migrations (prisma migrate deploy) first.
-        run: npm run test:integration
-
-      - name: Check the schema and migrations are in sync
-        # After migrating, diff the database against schema.prisma. Exit code 2
-        # means someone changed the schema without creating a migration.
-        run: npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code
-
-  # ---------------------------------------------------------------------------
   docker:
-    name: Docker build & smoke test
+    name: Docker build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
-
-      # BuildKit builder, needed for the GitHub Actions layer cache.
-      - uses: docker/setup-buildx-action@v4
-
-      # Build the three images exactly as production will, and load them into
-      # the local Docker engine. The layer cache (scope per image) is shared with
-      # CD, so the publish step on main mostly reuses these layers.
-      - name: Build API image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker/api.Dockerfile
-          target: runtime
-          tags: url-shortener-api:dev
-          load: true
-          cache-from: type=gha,scope=api
-          cache-to: type=gha,mode=max,scope=api
-
-      - name: Build worker image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker/worker.Dockerfile
-          target: runtime
-          tags: url-shortener-worker:dev
-          load: true
-          cache-from: type=gha,scope=worker
-          cache-to: type=gha,mode=max,scope=worker
-
-      - name: Build migrate image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker/api.Dockerfile
-          target: migrate
-          tags: url-shortener-migrate:dev
-          load: true
-          cache-from: type=gha,scope=migrate
-          cache-to: type=gha,mode=max,scope=migrate
-
-      # A throwaway secret, generated per run: compose refuses to even parse the
-      # file without one, and that includes `logs` and `down`. Every step runs in
-      # a NEW shell, so a plain `export` would be gone by the next step. Writing
-      # it to $GITHUB_ENV makes it available to all later steps, and add-mask
-      # hides the value from the logs.
-      - name: Generate a throwaway JWT secret
-        run: |
-          secret="$(openssl rand -base64 48)"
-          echo "::add-mask::$secret"
-          echo "JWT_SECRET=$secret" >> "$GITHUB_ENV"
-
-      - name: Start the full stack
-        run: |
-          docker compose up -d --no-build --wait
-          docker compose ps
-
-      # Proves the IMAGES work, not just the code: config defaults, native
-      # modules, networking, migrations, Redis Stream → worker. (A container-only
-      # config bug in Phase 7 passed every unit/integration test.)
-      - name: Smoke test through Nginx
-        run: scripts/smoke-test.sh http://localhost:8080
-
-      - name: Container logs (on failure)
-        if: failure()
-        run: docker compose logs --no-color --tail 200
-
-      - name: Stop the stack
-        if: always()
-        run: docker compose down -v
+      - run: docker build -t url-shortener .

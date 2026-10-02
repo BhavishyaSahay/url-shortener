@@ -1,130 +1,75 @@
 import { prisma } from '../config/database.js';
 import { encode } from '../utils/base62.js';
-import { ConflictError, NotFoundError, isRecordNotFoundError, isUniqueConstraintError } from '../utils/errors.js';
-import { logger } from '../utils/logger.js';
-import { invalidateUrl } from './urlCache.service.js';
-
-// How many times to retry if a generated code is already taken by a custom
-// alias. Each retry uses a fresh sequence number, so repeated collisions are
-// vanishingly unlikely; the cap only guards against an infinite loop.
-const MAX_GENERATION_ATTEMPTS = 5;
+import { ConflictError, NotFoundError, isRecordNotFound, isUniqueViolation } from '../utils/errors.js';
+import { removeFromCache } from './redirect.service.js';
 
 /**
- * Reserve the next URL ID from PostgreSQL's sequence.
- *
- * nextval() is atomic and never hands out the same number twice, even to
- * concurrent transactions on different API instances, and even if a
- * transaction later rolls back. That's what makes ID-based codes
- * collision-free between generated codes, with no locks and no "check if the
- * code exists" query.
- */
-async function reserveNextUrlId() {
-  const [{ id }] = await prisma.$queryRaw`SELECT nextval('urls_id_seq')::int AS id`;
-  return id;
-}
-
-/**
- * Create a short URL.
- *
- * Custom alias: insert it as the short code; the UNIQUE index rejects duplicates → 409.
- *
- * Generated code:
- *   1. id   = nextval('urls_id_seq')      e.g. 123456
- *   2. code = base62(id)                  e.g. "w7e"
- *   3. INSERT (id, short_code) in ONE statement: no second UPDATE and no
- *      window where a row exists without a code.
- * The only possible collision is with a custom alias someone already chose
- * that happens to equal base62(id), e.g. alias "w7e". The unique index catches
- * it, and we retry with the next id (leaving a harmless gap in the IDs).
+ * Short codes come from the database ID:
+ *   id   = nextval('urls_id_seq')   PostgreSQL never hands out the same number twice
+ *   code = base62(id)               e.g. 123456 → "w7e"
+ * So generated codes never clash with each other. They can clash with a custom
+ * alias someone already chose (alias "w7e"); the unique index on short_code
+ * catches that and we retry with the next ID.
  */
 export async function createUrl({ userId, originalUrl, customAlias, expiresAt }) {
-  const data = { userId, originalUrl, expiresAt: expiresAt ?? null };
+  const data = { userId, originalUrl, expiresAt };
 
   if (customAlias) {
     try {
-      const url = await prisma.url.create({ data: { ...data, shortCode: customAlias, isCustomAlias: true } });
-      // Someone may have visited /<alias> before it existed, leaving a
-      // negative "missing" entry in Redis. Clear it so the new link works immediately.
-      await invalidateUrl(url.shortCode);
-      return url;
+      return await prisma.url.create({ data: { ...data, shortCode: customAlias, isCustomAlias: true } });
     } catch (err) {
-      if (isUniqueConstraintError(err)) throw new ConflictError(`The alias "${customAlias}" is already taken`);
+      if (isUniqueViolation(err)) throw ConflictError(`The alias "${customAlias}" is already taken`);
       throw err;
     }
   }
 
-  for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
-    const id = await reserveNextUrlId();
-    const shortCode = encode(id);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const [{ id }] = await prisma.$queryRaw`SELECT nextval('urls_id_seq')::int AS id`;
     try {
-      const url = await prisma.url.create({ data: { ...data, id, shortCode } });
-      await invalidateUrl(url.shortCode); // same as above: clear any negative entry
-      return url;
+      return await prisma.url.create({ data: { ...data, id, shortCode: encode(id) } });
     } catch (err) {
-      if (!isUniqueConstraintError(err)) throw err;
-      logger.warn({ id, shortCode, attempt }, 'Generated short code collided with a custom alias, retrying');
+      if (!isUniqueViolation(err)) throw err; // clashed with an alias: try the next ID
     }
   }
-  throw new Error(`Could not generate a unique short code after ${MAX_GENERATION_ATTEMPTS} attempts`);
+  throw new Error('Could not generate a unique short code');
 }
 
-/**
- * The caller's URLs, newest first, with offset pagination. The query is
- * served by the (user_id, created_at DESC) index. id DESC breaks ties so the
- * order is stable when two links share a timestamp.
- */
 export async function listUrls({ userId, page, limit }) {
   const where = { userId };
   const [urls, total] = await Promise.all([
-    prisma.url.findMany({
-      where,
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-      skip: (page - 1) * limit,
-      take: limit,
-    }),
+    prisma.url.findMany({ where, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], skip: (page - 1) * limit, take: limit }),
     prisma.url.count({ where }),
   ]);
   return { urls, total };
 }
 
-// ---------------------------------------------------------------------------
-// Authorization: every single-URL operation filters by BOTH id AND userId,
-// in the same SQL statement (WHERE id = $1 AND user_id = $2). Someone else's
-// URL is indistinguishable from a missing one: both return 404, so the API
-// doesn't even confirm that the ID exists.
-// ---------------------------------------------------------------------------
-
+// Authorization: every query filters by id AND userId, so someone else's URL
+// behaves exactly like a URL that doesn't exist (404).
 export async function getUrl({ userId, id }) {
   const url = await prisma.url.findFirst({ where: { id, userId } });
-  if (!url) throw new NotFoundError('URL not found');
+  if (!url) throw NotFoundError('URL not found');
   return url;
 }
-
-// Cache invalidation: write to PostgreSQL FIRST, then delete the Redis entry.
-// The next redirect misses and reloads the fresh row. (Deleting instead of
-// overwriting the entry keeps one code path for filling the cache: the redirect.)
 
 export async function updateUrl({ userId, id, changes }) {
   let url;
   try {
-    // One atomic UPDATE … WHERE id = ? AND user_id = ?; no separate
-    // "load, check owner, save" steps that another request could interleave with.
     url = await prisma.url.update({ where: { id, userId }, data: changes });
   } catch (err) {
-    if (isRecordNotFoundError(err)) throw new NotFoundError('URL not found');
+    if (isRecordNotFound(err)) throw NotFoundError('URL not found');
     throw err;
   }
-  await invalidateUrl(url.shortCode);
+  await removeFromCache(url.shortCode); // the next redirect loads the new version
   return url;
 }
 
 export async function deleteUrl({ userId, id }) {
   let url;
   try {
-    url = await prisma.url.delete({ where: { id, userId } }); // returns the deleted row
+    url = await prisma.url.delete({ where: { id, userId } });
   } catch (err) {
-    if (isRecordNotFoundError(err)) throw new NotFoundError('URL not found');
+    if (isRecordNotFound(err)) throw NotFoundError('URL not found');
     throw err;
   }
-  await invalidateUrl(url.shortCode);
+  await removeFromCache(url.shortCode);
 }

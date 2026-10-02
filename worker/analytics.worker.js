@@ -1,83 +1,39 @@
-// Analytics worker: a separate Node.js process (not part of the API) that
-// consumes click events from a Redis Stream and writes analytics to PostgreSQL.
+// Analytics worker: a separate process that takes clicks off the Redis queue
+// and stores them in PostgreSQL, so redirects never wait for a database write.
 //
-//   npm run worker        (SERVICE_NAME=analytics-worker node worker/analytics.worker.js)
-//
-// Running it separately means analytics can be scaled, restarted or even be
-// down without affecting redirects. The stream holds the events meanwhile.
-import http from 'node:http';
-import { config } from '../src/config/env.js';
-import { connectDatabase, disconnectDatabase } from '../src/config/database.js';
+//   npm run worker
+import { setTimeout as sleep } from 'node:timers/promises';
+import { prisma } from '../src/config/database.js';
+import { connectRedis, redis } from '../src/config/redis.js';
+import { CLICKS_QUEUE } from '../src/services/clicks.service.js';
 import { logger } from '../src/utils/logger.js';
-import { startClickConsumer } from './analytics.consumer.js';
+import { saveClick } from './analytics.processor.js';
 
-let consumer;
+let running = true;
 
-// Minimal health endpoint: the worker has no other HTTP server, but Docker's
-// HEALTHCHECK (and later Prometheus) needs something to ask. It answers 200
-// while the process is alive, even while still waiting for Redis or
-// retrying a failed batch: those are recoverable states, not reasons to restart.
-const healthServer = http.createServer((req, res) => {
-  if (req.url !== '/health') {
-    res.writeHead(404).end();
-    return;
+async function run() {
+  await connectRedis();
+  logger.info('Analytics worker started');
+
+  while (running) {
+    try {
+      // BRPOP waits (up to 5 s) until a click is in the queue, then removes and
+      // returns it. Returns null if nothing arrived in time.
+      const item = await redis.brpop(CLICKS_QUEUE, 5);
+      if (item) await saveClick(item[1]);
+    } catch {
+      await sleep(1000); // Redis unavailable: wait, then try again
+    }
   }
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(
-    JSON.stringify({
-      status: 'ok',
-      uptimeSeconds: Math.round(process.uptime()),
-      ...(consumer ? consumer.getStatus() : { consuming: false }),
-    }),
-  );
-});
 
-async function start() {
-  healthServer.listen(config.workerHealthPort, () => {
-    logger.info({ port: config.workerHealthPort }, 'Worker health endpoint listening');
-  });
-
-  // Unlike the API, the worker genuinely NEEDS its dependencies: it waits for
-  // PostgreSQL (with retries), and the consumer waits for Redis.
-  await connectDatabase();
-  consumer = await startClickConsumer();
-  logger.info({ stream: config.clicks.stream, group: config.clicks.consumerGroup }, 'Analytics worker consuming');
+  await prisma.$disconnect();
+  redis.disconnect();
+  logger.info('Analytics worker stopped');
+  process.exit(0);
 }
 
-// Graceful shutdown: let the current batch finish and be acknowledged. Anything
-// not yet acknowledged stays pending in the stream and is picked up next time.
-let shuttingDown = false;
-async function shutdown(signal) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  logger.info({ signal }, 'Worker shutdown started');
+// Graceful shutdown: finish the current click, then exit (within 5 s, the BRPOP timeout).
+process.on('SIGTERM', () => (running = false));
+process.on('SIGINT', () => (running = false));
 
-  const forceExit = setTimeout(() => {
-    logger.error('Worker shutdown timed out, forcing exit');
-    process.exit(1);
-  }, config.shutdownTimeoutMs);
-  forceExit.unref();
-
-  try {
-    healthServer.close();
-    await consumer?.stop();
-    await disconnectDatabase();
-    logger.info('Worker shutdown complete');
-    process.exit(0);
-  } catch (err) {
-    logger.error({ err }, 'Error during worker shutdown');
-    process.exit(1);
-  }
-}
-
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('unhandledRejection', (reason) => {
-  logger.fatal({ err: reason }, 'Unhandled promise rejection');
-  process.exit(1);
-});
-
-start().catch((err) => {
-  logger.fatal({ err }, 'Analytics worker failed to start');
-  process.exit(1);
-});
+run();

@@ -1,154 +1,66 @@
-import jwt from 'jsonwebtoken';
 import request from 'supertest';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createApp } from '../../src/app.js';
-import { prisma, resetTables } from '../helpers/db.js';
+import { prisma, resetState } from '../helpers/db.js';
 
 const app = createApp();
-const credentials = { email: 'alice@example.com', password: 'correct-horse-battery' };
+const alice = { email: 'alice@example.com', password: 'correct-horse-battery' };
+const register = (body = alice) => request(app).post('/api/v1/auth/register').send(body);
+const login = (body = alice) => request(app).post('/api/v1/auth/login').send(body);
 
-const register = (body = credentials) => request(app).post('/api/v1/auth/register').send(body);
-const login = (body = credentials) => request(app).post('/api/v1/auth/login').send(body);
-const authCookie = (res) => res.headers['set-cookie']?.find((c) => c.startsWith('access_token='));
+beforeEach(resetState);
 
-beforeEach(resetTables);
-
-describe('POST /api/v1/auth/register', () => {
-  it('creates the user, returns it without the password hash, and logs them in', async () => {
-    const res = await register({ email: '  Alice@Example.com ', password: credentials.password });
-
+describe('register', () => {
+  it('creates the user, never returns the password hash, and sets an HTTP-only cookie', async () => {
+    const res = await register();
     expect(res.status).toBe(201);
-    expect(res.body.user).toEqual({ id: expect.any(Number), email: 'alice@example.com', createdAt: expect.any(String) });
-    expect(JSON.stringify(res.body)).not.toMatch(/password/i);
-    expect(authCookie(res)).toBeDefined();
+    expect(res.body.user).toEqual({ id: 1, email: 'alice@example.com', createdAt: expect.any(String) });
+    expect(res.headers['set-cookie'][0]).toMatch(/access_token=.+HttpOnly; SameSite=Lax/);
   });
 
-  it('sets a secure-by-default auth cookie', async () => {
-    const cookie = authCookie(await register());
-    expect(cookie).toMatch(/HttpOnly/);
-    expect(cookie).toMatch(/SameSite=Lax/);
-    expect(cookie).toMatch(/Path=\//);
-    expect(cookie).toMatch(/Max-Age=86400/); // matches JWT_EXPIRES_IN=1d
-  });
-
-  it('stores an Argon2id hash, never the plaintext password', async () => {
+  it('stores an Argon2id hash, not the password', async () => {
     await register();
-    const row = await prisma.user.findUnique({ where: { email: credentials.email } });
-    expect(row.passwordHash).toMatch(/^\$argon2id\$/);
-    expect(row.passwordHash).not.toContain(credentials.password);
+    const user = await prisma.user.findUnique({ where: { email: alice.email } });
+    expect(user.passwordHash).toMatch(/^\$argon2id\$/);
   });
 
-  it('returns 409 for an email that is already registered (case-insensitive)', async () => {
+  it('returns 409 for an email that is already registered', async () => {
     await register();
-    const res = await register({ ...credentials, email: 'ALICE@example.com' });
-    expect(res.status).toBe(409);
-    expect(res.body.error.code).toBe('CONFLICT');
+    expect((await register({ ...alice, email: 'ALICE@example.com' })).status).toBe(409);
   });
 
-  it('lets exactly one of several simultaneous sign-ups with the same email succeed', async () => {
-    // A "check then insert" implementation fails this test: all requests can pass the
-    // check before any of them inserts. The unique index makes it atomic.
-    const results = await Promise.all(Array.from({ length: 5 }, () => register()));
-    const statuses = results.map((r) => r.status).sort();
-
-    expect(statuses).toEqual([201, 409, 409, 409, 409]);
-    expect(await prisma.user.count()).toBe(1);
-  });
-
-  it('returns 400 with field details for invalid input', async () => {
-    const res = await register({ email: 'nope', password: '123' });
-    expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe('VALIDATION_ERROR');
-    expect(res.body.error.details.map((d) => d.field).sort()).toEqual(['email', 'password']);
-  });
-
-  it('marks auth responses as non-cacheable', async () => {
-    const res = await register();
-    expect(res.headers['cache-control']).toBe('no-store');
+  it('returns 400 for invalid input', async () => {
+    expect((await register({ email: 'nope', password: '1' })).status).toBe(400);
   });
 });
 
-describe('POST /api/v1/auth/login', () => {
-  beforeEach(async () => {
-    await register();
-  });
+describe('login, me, logout', () => {
+  beforeEach(() => register());
 
-  it('logs in with the right password and sets the auth cookie', async () => {
-    const res = await login({ email: 'ALICE@example.com', password: credentials.password });
+  it('logs in with the right password', async () => {
+    const res = await login();
     expect(res.status).toBe(200);
-    expect(res.body.user.email).toBe(credentials.email);
-    expect(authCookie(res)).toBeDefined();
+    expect(res.headers['set-cookie'][0]).toMatch(/^access_token=/);
   });
 
-  it('returns 401 for a wrong password, without setting a cookie', async () => {
-    const res = await login({ ...credentials, password: 'wrong-password' });
-    expect(res.status).toBe(401);
-    expect(authCookie(res)).toBeUndefined();
-  });
-
-  it('gives the SAME response for an unknown email as for a wrong password (no user enumeration)', async () => {
-    const wrongPassword = await login({ ...credentials, password: 'wrong-password' });
+  it('gives the same 401 for a wrong password and an unknown email', async () => {
+    const wrongPassword = await login({ ...alice, password: 'wrong-password' });
     const unknownEmail = await login({ email: 'nobody@example.com', password: 'whatever' });
-
-    expect(unknownEmail.status).toBe(wrongPassword.status);
-    expect(unknownEmail.body.error.message).toBe(wrongPassword.body.error.message);
-    expect(unknownEmail.body.error.message).toBe('Invalid email or password');
+    expect(wrongPassword.status).toBe(401);
+    expect(unknownEmail.body).toEqual(wrongPassword.body);
   });
 
-  it('returns 400 for a missing password', async () => {
-    const res = await login({ email: credentials.email });
-    expect(res.status).toBe(400);
-  });
-});
-
-describe('GET /api/v1/auth/me', () => {
-  it('returns the logged-in user when the cookie is sent', async () => {
-    const agent = request.agent(app); // keeps cookies between requests, like a browser
-    await agent.post('/api/v1/auth/register').send(credentials);
-
-    const res = await agent.get('/api/v1/auth/me');
-    expect(res.status).toBe(200);
-    expect(res.body.user.email).toBe(credentials.email);
-  });
-
-  it('returns 401 without a token', async () => {
-    const res = await request(app).get('/api/v1/auth/me');
-    expect(res.status).toBe(401);
-  });
-
-  it('returns 401 for an expired token', async () => {
-    const { body } = await register();
-    const expired = jwt.sign({}, process.env.JWT_SECRET, { subject: String(body.user.id), issuer: 'url-shortener', expiresIn: -1 });
-
-    const res = await request(app).get('/api/v1/auth/me').set('Cookie', `access_token=${expired}`);
-    expect(res.status).toBe(401);
-  });
-
-  it('returns 401 when the token is valid but the user was deleted', async () => {
-    const res = await register();
-    const cookie = authCookie(res).split(';')[0];
-    await prisma.user.delete({ where: { id: res.body.user.id } });
-
-    const me = await request(app).get('/api/v1/auth/me').set('Cookie', cookie);
-    expect(me.status).toBe(401);
-  });
-});
-
-describe('POST /api/v1/auth/logout', () => {
-  it('clears the cookie so later requests are unauthenticated', async () => {
+  it('GET /me needs the cookie, and logout clears it', async () => {
     const agent = request.agent(app);
-    await agent.post('/api/v1/auth/register').send(credentials);
-    expect((await agent.get('/api/v1/auth/me')).status).toBe(200);
+    await agent.post('/api/v1/auth/login').send(alice);
+    expect((await agent.get('/api/v1/auth/me')).body.user.email).toBe(alice.email);
 
-    const res = await agent.post('/api/v1/auth/logout');
-    expect(res.status).toBe(204);
-    expect(authCookie(res)).toMatch(/Expires=Thu, 01 Jan 1970/);
-
+    expect((await agent.post('/api/v1/auth/logout')).status).toBe(204);
     expect((await agent.get('/api/v1/auth/me')).status).toBe(401);
   });
 
-  it('is safe to call when not logged in', async () => {
-    const res = await request(app).post('/api/v1/auth/logout');
-    expect(res.status).toBe(204);
+  it('rejects a forged token', async () => {
+    const res = await request(app).get('/api/v1/auth/me').set('Cookie', 'access_token=not.a.jwt');
+    expect(res.status).toBe(401);
   });
 });

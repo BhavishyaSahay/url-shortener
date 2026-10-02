@@ -3,115 +3,91 @@
 [![CI](https://github.com/BhavishyaSahay/url-shortener/actions/workflows/ci.yml/badge.svg)](https://github.com/BhavishyaSahay/url-shortener/actions/workflows/ci.yml)
 [![CD](https://github.com/BhavishyaSahay/url-shortener/actions/workflows/cd.yml/badge.svg)](https://github.com/BhavishyaSahay/url-shortener/actions/workflows/cd.yml)
 
-A scalable URL shortener (a simplified Bitly) built as a final-year CS project to show backend
-engineering and the basics of deploying, monitoring and operating a service.
+A simplified Bitly: create short links (with optional custom aliases and expiry dates), share
+them, and see who clicked.
 
-**Stack:** Node.js (ES Modules) · Express 5 · PostgreSQL + Prisma · Redis (cache, rate limits, Streams) · Docker ·
-Nginx · GitHub Actions · AWS EC2 · Prometheus + Grafana · Vitest + Supertest · k6
+**Stack:** Node.js · Express · PostgreSQL + Prisma · Redis · Docker · Nginx · GitHub Actions · AWS EC2
 
-## Status
+## Features
 
-The project is built in phases, and each one is verified before the next starts.
+- Register, log in, log out (Argon2 password hashing, JWT in an HTTP-only cookie)
+- Create short URLs: generated Base62 codes or custom aliases, optional expiry
+- List, update, deactivate and delete your own URLs
+- Fast redirects with a Redis cache
+- Click analytics (total, per day, top referrers, top user agents) processed by a background worker
+- Rate limiting on login and URL creation
+- Docker Compose setup with Nginx in front of two API containers
+- CI (lint, tests, Docker build) and CD (image to GitHub Container Registry, deploy to EC2)
 
-| Phase | Scope | Status |
-| ----- | ----- | ------ |
-| 1 | Express backend, config, `/health`, error handling, logging | ✅ Done |
-| 2 | PostgreSQL + Prisma schema, migrations, indexes, `/ready` | ✅ Done |
-| 3 | Authentication: Argon2id, JWT in HTTP-only cookies | ✅ Done |
-| 4 | URL shortening: Base62, custom aliases, expiry, CRUD with ownership checks | ✅ Done |
-| 5 | Redirects, Redis cache-aside, negative caching, fixed-window rate limiting | ✅ Done |
-| 6 | Click events via a Redis Stream (first built on Kafka, see [LLD](docs/LLD.md#why-redis-streams-and-not-kafka)), analytics worker (idempotent, batched, dead-letter), analytics API | ✅ Done |
-| 7 | Docker (multi-stage, non-root), Compose (dev + prod), Nginx load balancing | ✅ Done |
-| 8 | CI (lint, audit, unit, integration, Docker smoke test), CD (GHCR images, SSH deploy, auto-rollback) | ✅ Done |
-| 9 | AWS EC2 deployment | ⏳ |
-| 10 | Prometheus + Grafana monitoring | ⏳ |
-| 11 | k6 load testing | ⏳ |
+## Architecture
 
-## Running locally
+```text
+Browser ──► Nginx ──► Express API (×2) ──► PostgreSQL
+                          │
+                          ├──► Redis: URL cache + rate limits
+                          └──► Redis list "clicks" ──► Analytics worker ──► PostgreSQL
+```
 
-### Option A: everything in Docker (recommended)
+Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Endpoints: [docs/API.md](docs/API.md)
+
+## Run it locally
 
 Requirements: Docker Desktop.
 
 ```bash
 cp .env.example .env
-# set JWT_SECRET in .env (required, 32+ chars):
+# put a random value in JWT_SECRET (32+ characters):
 node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"
 docker compose up -d --build --wait
 ```
 
-Open **http://localhost:8080** (Nginx → 2 API instances). That starts PostgreSQL, Redis,
-the migrations, 2 API replicas, the analytics worker and Nginx.
+Open **http://localhost:8080** and try:
 
 ```bash
-curl http://localhost:8080/health   # liveness: is the process up?
-curl http://localhost:8080/ready    # readiness: PostgreSQL (critical), Redis (optional)
-docker compose ps                   # health of every container
-docker compose down                 # stop (data is kept; add -v to delete it)
+curl http://localhost:8080/health
+curl -c cookies.txt -X POST http://localhost:8080/api/v1/auth/register \
+  -H 'Content-Type: application/json' -d '{"email":"me@example.com","password":"password123"}'
+curl -b cookies.txt -X POST http://localhost:8080/api/v1/urls \
+  -H 'Content-Type: application/json' -d '{"url":"https://example.com/some/long/page"}'
 ```
 
-### Option B: app on the host, infrastructure in Docker (fast edit-reload)
-
-Requirements: Node.js 20.12+ and Docker.
+### Developing without rebuilding images
 
 ```bash
-cp .env.example .env                                # and set JWT_SECRET as above
-npm install                                         # also generates the Prisma client
-docker compose up -d --wait postgres redis          # just the infrastructure
-npm run db:migrate                                  # apply database migrations
-npm run dev                                         # terminal 1: API on http://localhost:3000
-npm run worker:dev                                  # terminal 2: analytics worker
+npm install
+npm run db:up        # only PostgreSQL and Redis in Docker
+npm run db:migrate   # apply migrations
+npm run dev          # API on http://localhost:3000 (restarts on changes)
+npm run worker       # analytics worker (second terminal)
 ```
 
-Infrastructure ports on the host avoid clashing with locally installed services:
-**PostgreSQL 5433**, **Redis 6380**, **Nginx 8080**. Change them in `.env` if needed.
+## Tests
 
-## Scripts
+```bash
+npm run db:up   # tests need PostgreSQL and Redis (they use a separate test database)
+npm test        # unit + integration tests
+npm run lint
+```
 
-| Command | Description |
-| ------- | ----------- |
-| `npm run dev` | Start with `node --watch` (auto-restart on changes) |
-| `npm start` | Start normally (used in production) |
-| `npm run lint` | Run ESLint |
-| `npm test` | Run all tests |
-| `npm run test:unit` | Unit tests only |
-| `npm run test:integration` | Integration tests (need the Docker services running; use a `_test` DB, Redis DB 1 and a per-run click stream) |
-| `npm run worker` | Start the analytics worker (`worker:dev` for auto-reload) |
-| `npm run db:up` | Start the Docker stack and wait for its health checks |
-| `npm run db:migrate` | Create/apply migrations in development |
-| `npm run db:deploy` | Apply pending migrations (CI/production) |
-| `npm run db:studio` | Browse the database in Prisma Studio |
-| `npm run docker:up` | Build and start the whole stack in Docker, wait until healthy |
-| `npm run docker:down` | Stop the Docker stack (data kept) |
-| `npm run docker:logs` | Follow API, worker and Nginx logs |
+## Deployment
+
+Every push to `main` runs CI; if it passes, CD builds the Docker image, pushes it to GitHub
+Container Registry and deploys it to an AWS EC2 server over SSH (`docker compose pull && up`).
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#deployment).
 
 ## Project structure
 
 ```text
 src/
-  config/       environment config (validated at startup)
-  controllers/  HTTP layer: parse the request, call a service, send the response
-  services/     business logic, with no Express objects
-  routes/       URL → controller mapping, API versioning (/api/v1)
-  middleware/   auth, rate limiting, error handling
-  utils/        logger, error classes, Base62, validation
-  app.js        builds the Express app (used by server and tests)
-  server.js     starts the HTTP server and handles graceful shutdown
-prisma/         schema.prisma + SQL migrations
-worker/         analytics worker: Redis Stream consumer → PostgreSQL (separate process)
-docker/         multi-stage Dockerfiles (api, worker)
-.github/        CI and CD workflows, Dependabot
-scripts/        smoke test (used by CI and CD)
-infrastructure/ deployment script run on the server
-nginx/          reverse proxy / load balancer config
-tests/          unit/, integration/, load/ (k6)
-docs/           HLD, LLD, API, DATABASE, DEVOPS
+  config/       env validation, Prisma (PostgreSQL), Redis
+  routes/       URL → controller
+  controllers/  read the request, call a service, send the response
+  services/     business logic: auth, URLs, redirect + cache, click queue, analytics
+  middleware/   auth, rate limiting, errors
+  utils/        Base62, validation, JWT, passwords, errors, logger
+worker/         analytics worker (Redis queue → PostgreSQL)
+prisma/         database schema and migrations
+tests/          unit and integration tests
+nginx/          reverse proxy config
+.github/        CI and CD workflows
 ```
-
-## Documentation
-
-- [docs/HLD.md](docs/HLD.md): high-level design (architecture, flows, scaling, failure handling)
-- [docs/API.md](docs/API.md): endpoints with curl examples
-- [docs/LLD.md](docs/LLD.md): low-level design (click stream, caching, rate limiting, Base62, concurrency, auth)
-- [docs/DATABASE.md](docs/DATABASE.md): schema, indexes, constraints, pooling
-- [docs/DEVOPS.md](docs/DEVOPS.md): Docker, Compose, Nginx, CI/CD pipelines, deploys and rollbacks, secrets

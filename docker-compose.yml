@@ -1,204 +1,78 @@
-# Local development environment: the whole system in containers.
+# Local environment: the whole app in containers.
 #
-#   docker compose up -d --build --wait    build images, start everything, wait until healthy
-#   docker compose ps                      status + health of every container
+#   docker compose up -d --build --wait    build and start everything
 #   docker compose logs -f api worker      follow logs
-#   docker compose up -d --build api       rebuild + restart just the API after a code change
-#   docker compose down                    stop and remove containers (data volumes are kept)
-#   docker compose down -v                 ...and DELETE all data (Postgres, Redis)
+#   docker compose down                    stop (data is kept; add -v to delete it)
 #
-# Open http://localhost:8080 (through Nginx).
-#
-# Networks: two, so each service can only reach what it needs.
-#
-#   frontend:  nginx ── api
-#   backend:   api ── worker ── migrate ── postgres ── redis
-#
-# Nginx isn't on the backend network, so it can't reach PostgreSQL even if
-# compromised. Services find each other by SERVICE NAME (postgres, redis,
-# api) through Docker's built-in DNS. No IP addresses are hardcoded
-# anywhere: container IPs change every time a container is recreated.
-#
-# Secrets: only JWT_SECRET (and optionally POSTGRES_*) are read from .env,
-# which isn't committed. The database password below is a local-only default.
+# Then open http://localhost:8080 (nginx → 2 API containers).
+# Containers find each other by service name (postgres, redis, api).
 
 name: url-shortener
 
-# Reusable blocks (YAML anchors), so shared settings are written once.
-x-logging: &default-logging
-  driver: json-file
-  options:
-    max-size: "10m"   # rotate container logs so they can't fill the disk
-    max-file: "3"
-
-x-app-env: &app-env
-  NODE_ENV: production
-  LOG_LEVEL: info
-  # Containers reach each other by service name and CONTAINER port (5432, not the 5433 host port).
-  DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-url_shortener}
-  REDIS_URL: redis://redis:6379/0
-  CLICKS_STREAM: url-clicks         # Redis Stream carrying click events from the API to the worker
-  SHUTDOWN_TIMEOUT_MS: 10000
+# Shared by api, worker and migrate: the same image with different commands.
+x-app: &app
+  build: .
+  image: url-shortener:dev
+  environment:
+    NODE_ENV: production
+    DATABASE_URL: postgresql://postgres:postgres@postgres:5432/url_shortener
+    REDIS_URL: redis://redis:6379
+    JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+    APP_BASE_URL: http://localhost:8080
+    TRUST_PROXY: 1
+  restart: unless-stopped
 
 services:
-  # --------------------------------------------------------------------------
-  # Infrastructure
-  # --------------------------------------------------------------------------
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-url_shortener}
-    ports:
-      # Published on the host (127.0.0.1 only) for local tools: psql, Postico,
-      # Prisma Studio and the integration tests. 5433 avoids a local Postgres on 5432.
-      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    networks: [backend]
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: url_shortener
+    ports: ["127.0.0.1:5433:5432"] # for local tools and tests (5433 avoids a local Postgres)
+    volumes: [postgres-data:/var/lib/postgresql/data]
     healthcheck:
-      # Healthy only once Postgres accepts connections, not just when the process starts.
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: ["CMD", "pg_isready", "-U", "postgres"]
       interval: 5s
-      timeout: 3s
       retries: 10
-    restart: unless-stopped
-    logging: *default-logging
 
   redis:
     image: redis:7.4-alpine
-    # Redis has three jobs: URL cache, rate-limit counters, and the click-event
-    # STREAM (the queue to the analytics worker). The stream changes two settings:
-    #   --appendonly yes          persist writes to disk (fsync every second), so
-    #                             queued clicks survive a Redis restart
-    #   volatile-lru              when memory is full, evict only keys WITH a TTL
-    #                             (cache entries, rate-limit counters). The stream
-    #                             has no TTL, so it's never evicted. (allkeys-lru
-    #                             could silently evict the whole queue.)
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "", "--maxmemory", "128mb", "--maxmemory-policy", "volatile-lru"]
-    ports:
-      - "127.0.0.1:${REDIS_PORT:-6380}:6379"   # 6380 avoids a local Redis on 6379
-    volumes:
-      - redis-data:/data                       # the append-only file lives here
-    networks: [backend]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    restart: unless-stopped
-    logging: *default-logging
+    # Max 64 MB; when full, evict only keys with a TTL (cached URLs, rate-limit
+    # counters), never the click queue.
+    command: ["redis-server", "--maxmemory", "64mb", "--maxmemory-policy", "volatile-lru"]
+    ports: ["127.0.0.1:6380:6379"] # 6380 avoids a local Redis
 
-  # --------------------------------------------------------------------------
-  # Application
-  # --------------------------------------------------------------------------
-
-  # One-shot job: apply pending database migrations, then exit. The API and
-  # worker only start after it has finished successfully, so they never run
-  # against an out-of-date schema. Running it once here (rather than inside
-  # every API container at startup) avoids two instances migrating at once.
-  migrate:
-    build:
-      context: .
-      dockerfile: docker/api.Dockerfile
-      target: migrate
-    image: url-shortener-migrate:dev
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-url_shortener}
-      PRISMA_HIDE_UPDATE_MESSAGE: "1"
-      NPM_CONFIG_UPDATE_NOTIFIER: "false"
-    networks: [backend]
-    depends_on:
-      postgres:
-        condition: service_healthy
+  migrate: # runs once: applies database migrations, then exits
+    <<: *app
+    command: ["npx", "prisma", "migrate", "deploy"]
     restart: "no"
-    logging: *default-logging
+    depends_on:
+      postgres: { condition: service_healthy }
 
   api:
-    build:
-      context: .
-      dockerfile: docker/api.Dockerfile
-      target: runtime
-    image: url-shortener-api:dev
-    # Two identical, stateless instances behind nginx: horizontal scaling.
-    # (Change at runtime with: docker compose up -d --scale api=3)
+    <<: *app
     deploy:
-      replicas: 2
-    environment:
-      <<: *app-env
-      SERVICE_NAME: url-shortener-api
-      PORT: 3000
-      APP_BASE_URL: http://localhost:${NGINX_PORT:-8080}
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env (see .env.example)}
-      COOKIE_SECURE: "false"          # plain HTTP locally; true once HTTPS exists (Phase 9)
-      TRUST_PROXY: 1                  # exactly one proxy (nginx) in front
-      DB_POOL_MAX: 10
-    # No `ports:`. The API is only reachable through nginx, on the Docker network.
-    networks: [frontend, backend]
+      replicas: 2 # two identical API containers behind nginx
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 10s
     depends_on:
-      migrate:
-        condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
-      # Redis is optional for the API (it degrades without it), so it only
-      # needs to have started, not to be healthy.
-      redis:
-        condition: service_started
-    init: true                        # tiny init process as PID 1: forwards signals, reaps zombies
-    stop_grace_period: 15s            # SIGTERM → up to 15 s for graceful shutdown → SIGKILL
-    restart: unless-stopped
-    logging: *default-logging
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_started }
 
   worker:
-    build:
-      context: .
-      dockerfile: docker/worker.Dockerfile
-      target: runtime
-    image: url-shortener-worker:dev
-    environment:
-      <<: *app-env
-      SERVICE_NAME: analytics-worker
-      CLICKS_CONSUMER_GROUP: analytics-worker
-      DB_POOL_MAX: 5                  # batched writes need few connections
-      # Note: no JWT_SECRET. The worker never signs tokens (least privilege).
-    networks: [backend]
+    <<: *app
+    command: ["node", "worker/analytics.worker.js"]
     depends_on:
-      migrate:
-        condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy    # unlike the API, the worker can't do anything without the stream
-    init: true
-    stop_grace_period: 15s
-    # If the process dies, Docker starts a new one. Entries it hadn't
-    # acknowledged are still pending in the stream and get processed (or claimed).
-    restart: unless-stopped
-    logging: *default-logging
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_started }
 
   nginx:
     image: nginx:1.28-alpine
-    ports:
-      - "${NGINX_PORT:-8080}:80"      # the only way into the application
-    volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    networks: [frontend]
+    ports: ["8080:80"]
+    volumes: [./nginx/nginx.conf:/etc/nginx/nginx.conf:ro]
     depends_on:
-      api:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
-      interval: 10s
-      timeout: 3s
-      retries: 3
-    restart: unless-stopped
-    logging: *default-logging
-
-networks:
-  frontend:
-  backend:
+      api: { condition: service_healthy }
 
 volumes:
   postgres-data:
-  redis-data:

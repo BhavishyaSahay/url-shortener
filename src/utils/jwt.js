@@ -1,37 +1,24 @@
 import jwt from 'jsonwebtoken';
 import { config } from '../config/env.js';
 
-// JSON Web Token = base64url(header).base64url(payload).signature
-// The payload is only encoded, NOT encrypted: anyone can read it, so it holds
-// just the user ID. The HMAC-SHA256 signature (made with JWT_SECRET) is what
-// stops a client from editing the payload, e.g. changing "sub" to another user's ID.
-const ALGORITHM = 'HS256';
-const ISSUER = 'url-shortener';
+export const TOKEN_LIFETIME_SECONDS = 24 * 60 * 60; // 1 day
 
-export function signAccessToken(userId) {
-  return jwt.sign({}, config.auth.jwtSecret, {
-    algorithm: ALGORITHM,
-    subject: String(userId), // "sub" claim: who this token is about
-    issuer: ISSUER,
-    expiresIn: config.auth.jwtExpiresInSeconds, // "exp" claim, checked by verify()
+// The token's payload is readable by anyone, so it holds only the user ID.
+// The signature (HMAC-SHA256 with JWT_SECRET) stops anyone from changing it.
+export function signToken(userId) {
+  return jwt.sign({}, config.jwtSecret, {
+    algorithm: 'HS256',
+    subject: String(userId),
+    expiresIn: TOKEN_LIFETIME_SECONDS,
   });
 }
 
-/**
- * Returns the user ID from a valid token, or null if the token is missing,
- * tampered with, expired, or signed differently.
- */
-export function verifyAccessToken(token) {
-  if (!token) return null;
+/** Returns the user ID, or null if the token is missing, invalid or expired. */
+export function verifyToken(token) {
   try {
-    const payload = jwt.verify(token, config.auth.jwtSecret, {
-      // Pin the algorithm. Otherwise a forged token could claim "alg": "none"
-      // or another algorithm and try to skip signature verification.
-      algorithms: [ALGORITHM],
-      issuer: ISSUER,
-    });
-    const userId = Number(payload.sub);
-    return Number.isSafeInteger(userId) && userId > 0 ? userId : null;
+    // Pinning the algorithm blocks forged tokens that claim "alg": "none".
+    const payload = jwt.verify(token, config.jwtSecret, { algorithms: ['HS256'] });
+    return Number(payload.sub);
   } catch {
     return null;
   }
