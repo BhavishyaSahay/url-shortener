@@ -47,7 +47,7 @@ curl -c cookies.txt -X POST http://localhost:8080/api/v1/auth/register \
 | GET | `/api/v1/urls/:id/analytics` | | `200` (below) |
 
 Rules: `url` must be `http://` or `https://`. `customAlias` is 3–32 characters of letters,
-numbers, `-` or `_`. `expiresAt` is an ISO date in the future, e.g. `2026-12-31T00:00:00Z`.
+numbers, `-` or `_` (`api`, `app`, `health` and `ready` are reserved). `expiresAt` is an ISO date in the future, e.g. `2026-12-31T00:00:00Z`.
 
 ```bash
 curl -b cookies.txt -X POST http://localhost:8080/api/v1/urls \
@@ -93,3 +93,10 @@ Clicks are saved by the background worker, so they appear a moment after the red
 | Method | Path | Response |
 | ------ | ---- | -------- |
 | GET | `/:shortCode` | `302` to the original URL (`X-Cache: HIT` or `MISS`), `404` unknown, `410` deactivated or expired |
+
+## Frontend
+
+| Method | Path | Response |
+| ------ | ---- | -------- |
+| GET | `/` | `302` to `/app/` |
+| GET | `/app/...` | The React app (only when it has been built, e.g. in Docker) |

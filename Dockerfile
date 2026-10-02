@@ -1,8 +1,10 @@
 # One image for the API, the analytics worker and database migrations: the
 # same code, started with a different command (see docker-compose.yml).
+# It also contains the built React frontend, which the API serves at /app.
 #
-# Multi-stage build: dependencies are installed in a "build" stage, and the
-# final image copies only the result (no dev tools, no npm cache).
+# Multi-stage build: dependencies are installed and the frontend is built in
+# separate stages, and the final image copies only the results (no dev tools,
+# no npm cache, no frontend source code).
 
 FROM node:24-alpine AS build
 WORKDIR /app
@@ -15,6 +17,14 @@ COPY prisma ./prisma
 # placeholder; nothing connects to a database while building.
 RUN DATABASE_URL=postgresql://build:build@localhost/build npm ci && npm prune --omit=dev
 
+# React frontend: build static files (HTML, JS, CSS) into /frontend/dist.
+FROM node:24-alpine AS frontend
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend ./
+RUN npm run build
+
 FROM node:24-alpine
 RUN apk add --no-cache openssl
 WORKDIR /app
@@ -24,6 +34,7 @@ COPY package.json prisma.config.js ./
 COPY prisma ./prisma
 COPY src ./src
 COPY worker ./worker
+COPY --from=frontend /frontend/dist ./frontend/dist
 USER node
 EXPOSE 3000
 CMD ["node", "src/server.js"]

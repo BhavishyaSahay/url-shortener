@@ -30,8 +30,8 @@ const longUrl = z
     }
   }, 'must be a valid http:// or https:// URL');
 
-// Aliases can't be names of real routes like /health.
-const RESERVED = new Set(['api', 'health', 'ready']);
+// Aliases can't be names of real routes like /health, or /app (the React frontend).
+const RESERVED = new Set(['api', 'app', 'health', 'ready']);
 const customAlias = z
   .string()
   .regex(/^[A-Za-z0-9_-]{3,32}$/, 'must be 3-32 letters, numbers, "-" or "_"')

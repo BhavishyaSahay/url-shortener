@@ -2,7 +2,8 @@ import js from '@eslint/js';
 import globals from 'globals';
 
 export default [
-  { ignores: ['node_modules/', 'coverage/'] },
+  // frontend/ has its own linter (oxlint, see frontend/package.json).
+  { ignores: ['node_modules/', 'coverage/', 'frontend/'] },
   js.configs.recommended,
   {
     languageOptions: {
@@ -16,10 +17,5 @@ export default [
       eqeqeq: ['error', 'always'],
       'prefer-const': 'error',
     },
-  },
-  {
-    // k6 scripts run inside k6's own JS runtime, not Node.
-    files: ['tests/load/**/*.js'],
-    languageOptions: { globals: { __ENV: 'readonly', __VU: 'readonly', __ITER: 'readonly' } },
   },
 ];

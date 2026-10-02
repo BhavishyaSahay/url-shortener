@@ -1,6 +1,9 @@
 # Dependencies
 node_modules/
 
+# Frontend build output
+frontend/dist/
+
 # Environment & secrets
 .env
 .env.*

@@ -30,7 +30,7 @@ describe('createUrlSchema', () => {
     expect(fields(createUrlSchema, { url })).toEqual(['url']);
   });
 
-  it.each(['ab', 'has space', 'health'])('rejects alias %j', (customAlias) => {
+  it.each(['ab', 'has space', 'health', 'app'])('rejects alias %j', (customAlias) => {
     expect(fields(createUrlSchema, { url: 'https://a.com', customAlias })).toEqual(['customAlias']);
   });
 

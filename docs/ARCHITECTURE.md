@@ -9,7 +9,7 @@
             ┌─────────┴─────────┐
             ▼                   ▼
       ┌──────────┐        ┌──────────┐
-      │ API (1)  │        │ API (2)  │   Express. Stateless, so any container can serve any request
+      │ API (1)  │        │ API (2)  │   Express (+ the React frontend's files). Stateless
       └────┬─────┘        └────┬─────┘
            └─────────┬─────────┘
            ┌─────────┴──────────────────┐
@@ -28,7 +28,7 @@
 | Component | Job |
 | --------- | --- |
 | **Nginx** | Receives all traffic on port 80 and forwards it to the API containers in turn (round-robin) |
-| **API** | Auth, URL management, redirects, rate limiting, analytics endpoints. Stateless: logins are JWTs and counters live in Redis, so it can run as several containers |
+| **API** | Auth, URL management, redirects, rate limiting, analytics endpoints, and the React frontend's static files. Stateless: logins are JWTs and counters live in Redis, so it can run as several containers |
 | **PostgreSQL** | The source of truth: users, URLs, clicks |
 | **Redis** | URL cache, rate-limit counters, and the `clicks` queue |
 | **Worker** | A separate process that saves clicks from the queue to PostgreSQL |
@@ -75,7 +75,7 @@ code = base62(123456)        → "w7e"     (32·62² + 7·62 + 14)
 - A custom alias is stored in the same `short_code` column. If someone already chose `w7e` as an
   alias, the unique index rejects the generated code and the app retries with the next ID.
 - Aliases must be 3–32 characters of letters, numbers, `-` or `_`, and can't be route names like
-  `health`.
+  `health` or `app` (the frontend).
 
 ## Redirects and caching
 
@@ -150,10 +150,38 @@ worker: BRPOP clicks ─────────┘  →  INSERT INTO click_even
   returns `404`, exactly like one that doesn't exist.
 - Login returns the same message for an unknown email and a wrong password.
 
+## Frontend
+
+A small React app (Vite, React Router, plain CSS) in `frontend/`: log in or sign up, shorten
+links, manage them, and see their analytics.
+
+```text
+/            → redirects to /app/
+/app/...     → the React app (index.html, JS, CSS), served by Express
+/api/v1/...  → the API
+/health, /ready
+/<anything>  → a short link
+```
+
+- **It lives under `/app/`** because every other single-segment path is a short link. The alias
+  `app` is reserved.
+- **Same origin as the API:** the page calls `/api/v1/...` with relative paths, so the browser
+  sends the HTTP-only login cookie automatically, and no CORS setup is needed. (A frontend on a
+  different domain would need CORS, plus `SameSite=None; Secure` cookies, which require HTTPS.)
+- **Logged in or not:** JavaScript can't read the HTTP-only cookie, so on load the app calls
+  `GET /api/v1/auth/me`. A `401` from any call sends the user to the login page.
+- **Built into the Docker image:** a separate stage of the `Dockerfile` runs `npm run build`, and
+  the final image contains only the built files (`frontend/dist`). Express serves them with
+  `express.static`, and answers any other `/app/...` path with `index.html` so React Router can
+  show the right page. One image means one thing to build, test and deploy.
+- **In development** the Vite dev server (`localhost:5173/app/`) reloads on every change and
+  forwards `/api` requests to the backend.
+
 ## Docker and Nginx
 
 - **One image** (`Dockerfile`, multi-stage) runs as the API (`node src/server.js`), the worker
-  (`node worker/analytics.worker.js`) or the migration job (`npx prisma migrate deploy`).
+  (`node worker/analytics.worker.js`) or the migration job (`npx prisma migrate deploy`). It also
+  contains the built frontend.
 - It runs as a non-root user.
 - **Compose** starts PostgreSQL, Redis, the migration job (once), 2 API containers, the worker and
   Nginx. Containers find each other by service name (`postgres`, `redis`, `api`).
@@ -170,7 +198,8 @@ worker: BRPOP clicks ─────────┘  →  INSERT INTO click_even
 ## CI/CD
 
 ```text
-push / pull request ──► CI: lint + unit & integration tests (real PostgreSQL + Redis) + docker build
+push / pull request ──► CI: lint + unit & integration tests (real PostgreSQL + Redis)
+                            + frontend lint & build + docker build
                               │ green, on main
                               ▼
                         CD: build image → push ghcr.io/<user>/url-shortener:<commit sha>

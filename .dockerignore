@@ -1,5 +1,6 @@
 # Kept out of the image: dependencies are installed inside it, and secrets must never be copied in.
-node_modules
+**/node_modules
+frontend/dist
 .env
 .env.*
 .git

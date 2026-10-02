@@ -6,10 +6,11 @@
 A simplified Bitly: create short links (with optional custom aliases and expiry dates), share
 them, and see who clicked.
 
-**Stack:** Node.js · Express · PostgreSQL + Prisma · Redis · Docker · Nginx · GitHub Actions · AWS EC2
+**Stack:** React (Vite) · Node.js · Express · PostgreSQL + Prisma · Redis · Docker · Nginx · GitHub Actions · AWS EC2
 
 ## Features
 
+- React frontend: sign up, shorten links, manage them, and see a chart of clicks per day
 - Register, log in, log out (Argon2 password hashing, JWT in an HTTP-only cookie)
 - Create short URLs: generated Base62 codes or custom aliases, optional expiry
 - List, update, deactivate and delete your own URLs
@@ -23,6 +24,7 @@ them, and see who clicked.
 
 ```text
 Browser ──► Nginx ──► Express API (×2) ──► PostgreSQL
+                          │  (also serves the React app at /app)
                           │
                           ├──► Redis: URL cache + rate limits
                           └──► Redis list "clicks" ──► Analytics worker ──► PostgreSQL
@@ -41,7 +43,7 @@ node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"
 docker compose up -d --build --wait
 ```
 
-Open **http://localhost:8080** and try:
+Open **http://localhost:8080** (it redirects to the app at `/app/`), or use the API directly:
 
 ```bash
 curl http://localhost:8080/health
@@ -61,12 +63,24 @@ npm run dev          # API on http://localhost:3000 (restarts on changes)
 npm run worker       # analytics worker (second terminal)
 ```
 
+Frontend with live reload (third terminal):
+
+```bash
+cd frontend
+npm install
+npm run dev          # http://localhost:5173/app/ (API calls go to the backend on 8080)
+```
+
+`npm run dev` in `frontend/` expects the backend on port 8080 (`docker compose up`). To use the
+`npm run dev` backend on port 3000 instead: `API_URL=http://localhost:3000 npm run dev`.
+
 ## Tests
 
 ```bash
 npm run db:up   # tests need PostgreSQL and Redis (they use a separate test database)
 npm test        # unit + integration tests
 npm run lint
+cd frontend && npm run lint && npm run build   # frontend checks
 ```
 
 ## Deployment
@@ -78,6 +92,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#deployment).
 ## Project structure
 
 ```text
+frontend/       React app (Vite): pages, components, API client
 src/
   config/       env validation, Prisma (PostgreSQL), Redis
   routes/       URL → controller
