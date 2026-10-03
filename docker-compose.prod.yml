@@ -26,6 +26,9 @@ services:
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: url_shortener
+    # Only on the server's own localhost (not the internet), so a database GUI
+    # can connect through an SSH tunnel: ssh -L 5434:localhost:5432 deploy@<server>
+    ports: ["127.0.0.1:5432:5432"]
     volumes: [postgres-data:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "postgres"]
