@@ -27,3 +27,6 @@ tests/load/results/
 .idea/
 .vscode/
 *.swp
+
+# Let's Encrypt certificates and keys (live only on the server, never in git)
+certbot/

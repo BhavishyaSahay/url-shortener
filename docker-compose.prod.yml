@@ -1,7 +1,7 @@
 # Production (the EC2 server). Same services as docker-compose.yml, except:
 #   - the image is pulled from GitHub Container Registry (built by CI/CD), never built here
 #   - secrets come from the .env file next to this one (compose refuses to start without them)
-#   - only nginx is reachable from outside, on port 80
+#   - only nginx is reachable from outside, on ports 80 and 443 (HTTPS, nginx/nginx.prod.conf)
 #
 # Deployed by the CD pipeline:
 #   IMAGE_TAG=<git sha> docker compose -f docker-compose.prod.yml pull
@@ -18,6 +18,7 @@ x-app: &app
     JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
     APP_BASE_URL: ${APP_BASE_URL:?set APP_BASE_URL in .env}
     TRUST_PROXY: 1
+    COOKIE_SECURE: "true" # the site is HTTPS: the login cookie is only sent over HTTPS
   restart: unless-stopped
 
 services:
@@ -68,8 +69,11 @@ services:
 
   nginx:
     image: nginx:1.28-alpine
-    ports: ["80:80"]
-    volumes: [./nginx/nginx.conf:/etc/nginx/nginx.conf:ro]
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      - ./certbot/conf:/etc/letsencrypt:ro # the certificate (written by certbot)
+      - ./certbot/www:/var/www/certbot:ro # Let's Encrypt's domain-check files
     depends_on:
       api: { condition: service_healthy }
     restart: unless-stopped

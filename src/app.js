@@ -21,10 +21,11 @@ export function createApp() {
   // Behind nginx, trust its X-Forwarded-For header so req.ip is the real client IP.
   app.set('trust proxy', config.trustProxy);
 
-  // Security headers. upgrade-insecure-requests is turned off because the site runs
-  // on plain HTTP for now: it would make browsers fetch the frontend's JS and CSS
-  // over HTTPS, which doesn't exist yet.
-  app.use(helmet({ contentSecurityPolicy: { directives: { upgradeInsecureRequests: null } } }));
+  // Security headers. upgrade-insecure-requests makes browsers load everything over
+  // HTTPS, so it's only on when the site is served over HTTPS (COOKIE_SECURE=true,
+  // production). On plain HTTP (local Docker) it would break the frontend's JS and CSS.
+  const upgradeInsecureRequests = config.cookieSecure ? [] : null;
+  app.use(helmet({ contentSecurityPolicy: { directives: { upgradeInsecureRequests } } }));
   app.use(pinoHttp({ logger, autoLogging: { ignore: (req) => req.url === '/health' } })); // one log line per request
   app.use(express.json({ limit: '10kb' }));
   app.use(cookieParser());
